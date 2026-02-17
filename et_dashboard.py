@@ -12,13 +12,22 @@ from retry_requests import retry
 
 #### 1. Page Configuration
 st.set_page_config(page_title="Irrigation Dashboard", layout="wide", page_icon="🌱")
+st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 0rem;
+            margin-top: 0rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
 st.title("🌱 Irrigation Dashboard")
 
 from data_manager import (
     load_json, save_json, get_prop_paths, 
     PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR  # <--- Make sure SYSTEM_DIR is here
 )
-from core_logic import SOIL_DATA, get_coords
+from core_logic import SOIL_DATA, get_coords, calculate_irrigation_limits
 
 
 # Initialize Session State
@@ -65,8 +74,6 @@ with head_col2:
             st.rerun()
                              
 
-# Display the title once
-st.title(f"🌱 {active_prop} ({active_zip})")
 
 # --- FILE PATHS ---
 # Zones and Logs stay in main folder for easy access
@@ -149,11 +156,16 @@ lat, lon, z_name = get_coords(active_zip)
 st.sidebar.header("💧 Irrigation Specs")
 area = st.sidebar.number_input("Zone Area (sq ft)", value=float(current_zone.get("area", 1000)))
 flow = st.sidebar.number_input("Zone Flow (GPM)", value=float(current_zone.get("flow", 5.0)))
-soil_types = ["Sand", "Loamy Sand", "Sandy Loam", "Loam", "Silt Loam", "Clay Loam", "Clay"]
+soil_types = list(SOIL_DATA.keys())
 saved_soil = current_zone.get("soil", "Loam")
-soil_index = soil_types.index(saved_soil) if saved_soil in soil_types else 3
+try:
+    soil_index = soil_types.index(saved_soil)
+except ValueError:
+    soil_index = soil_types.index("Loam") # Fallback if name mismatch
 
 soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
+# -------------------------
+
 depth_in = st.sidebar.slider("Root Depth (in)", 4, 36, int(current_zone.get("depth", 12)))
 mad = st.sidebar.slider("MAD (%)", 10, 60, int(current_zone.get("mad", 50)))
 
@@ -199,20 +211,16 @@ if st.sidebar.button("Add to History"):
 
 
 
-#### 5. MATH ENGINE (Rosetta Logic)
-phys = SOIL_DATA[soil_choice]
-fc_inft = phys["FC"]
-pwp_inft = phys["PWP"]
+#### 5. MATH ENGINE 
+# Call your new math engine
+aw_per_foot, paw_total, ad_limit = calculate_irrigation_limits(soil_choice, depth_in, mad)
 
-#### AW = FC - PWP (in in/ft)
-aw_inft = fc_inft - pwp_inft
-
-# PAW = AW * RZ (RZ converted to feet)
+# 2. Grab the raw constants for the audit display (converted to inches/foot)
+soil_info = SOIL_DATA.get(soil_choice, SOIL_DATA["Loam"])
+fc_inft = soil_info["FC"] * 12
+pwp_inft = soil_info["PWP"] * 12
 rz_ft = depth_in / 12
-paw_inches = aw_inft * rz_ft
 
-# AD = PAW * MAD
-allowable_depletion = paw_inches * (mad / 100)
 
 
 
@@ -347,25 +355,27 @@ if df_api is not None:
     
     
 #### 8. Dashboard Metrics
-    st.subheader(f"Zone: {selected_zone_name} ({z_name})")
+    st.markdown(f"### {active_prop} : {selected_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
+    st.divider()
     seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum()
     seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum()
     today_et = df_forecast.iloc[0]['ET0 (in)']
     today_rain = df_forecast.iloc[0]['Rain (in)']
     m1, m2, m3, m4 = st.columns(4)
     
-    # Metric 1 is now 7-Day ET
+    # Metric 3 is now 7-Day ET
     m3.metric("7-Day ET Forecast", f"{seven_day_et:.2f}\"", delta=f"Today: {today_et:.2f}\"", delta_color="inverse")
     
-    # Metric 2 7-Day Rain
+    # Metric 4 7-Day Rain
     m4.metric("7-Day Rain Forecast", f"{seven_day_rain:.2f}\"", delta=f"Today: {today_rain:.2f}\"")
     
-    # Metric 3 is now the Water to Apply (Depth, Time, and Vol)
+    # Metric 1 is now the Water to Apply (Depth, Time, and Vol)
     m1.metric("Water to Apply", f"{ current_deficit:.2f}\"", 
               delta=f"{runtime:.1f} min ({gallons:.0f} gal)")
      
-    # Metric 4: Allowable Depletion & Status Arrow [Logic: If deficit is less than AD, we are "OK" (Green). If deficit > AD, we are "Over" (Red).]
-    if current_deficit < allowable_depletion:
+    # Metric 2: Allowable Depletion & Status Arrow [Logic: If deficit is less than AD, we are "OK" (Green). If deficit > AD, we are "Over" (Red).]
+    # UPDATE: Changed allowable_depletion to ad_limit
+    if current_deficit < ad_limit:
         status_msg = "Wait to Apply"
         d_val = "OK"
         d_color = "normal" # Shows Green
@@ -376,7 +386,7 @@ if df_api is not None:
 
     m2.metric(
         label="Allowable Depletion", 
-        value=f"{allowable_depletion:.2f}\"", 
+        value=f"{ad_limit:.2f}\"", 
         delta=status_msg, 
         delta_color=d_color
     )
@@ -394,11 +404,12 @@ if df_api is not None:
   
 #### 9.1 Graphs & Tables
 st.divider()
-st.write(f"### 📈 Water Balance for {selected_zone_name}")
+with st.expander("📈 View Water Balance Graph", expanded=True):
+    st.write(f"### 📈 Water Balance for {selected_zone_name}")
 
     # 9.2 Setup Time Window (The "Secret Sauce" that fixed the blank screen)
-if not df_daily.empty:
-    now_dt = pd.Timestamp(datetime.now().date()).normalize()
+    if not df_daily.empty:
+        now_dt = pd.Timestamp(datetime.now().date()).normalize()
     # Calculation for the "Default View" (7 days back, 14 forward)
     view_start = now_dt - pd.Timedelta(days=7)
     view_end = now_dt + pd.Timedelta(days=14)
@@ -414,28 +425,28 @@ if not df_daily.empty:
 
     # --- 9.3 Create a Layered Chart (Bars for Water In, Line for Water Out) ---
     
-    # 1. ET Line (Water Loss)
+    #  ET Line (Water Loss)
     et_chart = alt.Chart(df_zoom).mark_line(strokeWidth=3, color='#FF8C00').encode(
         x=alt.X('time:T', title='Date'),
         y=alt.Y('ET0 (in):Q', title='Inches'),
         tooltip=['time:T', 'ET0 (in):Q']
     )
 
-    # 2. Rain Bars (Water Gain)
+    #  Rain Bars (Water Gain)
     rain_chart = alt.Chart(df_zoom).mark_bar(opacity=0.5, color='#ADD8E6').encode(
         x='time:T',
         y='Rain (in):Q',
         tooltip=['time:T', 'Rain (in):Q']
     )
 
-    # 3. Irrigation Bars (Water Gain)
+    #  Irrigation Bars (Water Gain)
     irr_chart = alt.Chart(df_zoom).mark_bar(size=10, color='#003366').encode(
         x='time:T',
         y='Irrigation (in):Q',
         tooltip=['time:T', 'Irrigation (in):Q']
     )
 
-    # 4. Today Marker
+    #  Today Marker
     today_line = alt.Chart(pd.DataFrame({'time': [now_dt]})).mark_rule(
         color='red', strokeDash=[5,5], strokeWidth=2
     ).encode(x='time:T')
@@ -459,6 +470,7 @@ if not df_daily.empty:
     """, unsafe_allow_html=True)
 
     #### 9.5 Data Tables
+with st.expander("📋 View Forecast & History Tables", expanded=False):
     tab1, tab2 = st.tabs(["🗓️ Forecast (Next 14 Days)", "📜 History (Past 90 Days)"])
     with tab1:
         st.dataframe(df_forecast.set_index("time").style.format("{:.2f}"), use_container_width=True)
@@ -598,13 +610,13 @@ else:
     
 #### 11. Math & Science Expander
 st.divider()
-st.subheader("📚 Reference & Methodology")
-
-tab_audit, tab_calc, tab_science = st.tabs([
-    "📊 Soil Physics Audit", 
-    "🧮 Calculation Logic", 
-    "🔬 Weather Science"
-])
+with st.expander("📚 Reference, Math & Science Methodology", expanded=False):
+    tab_audit, tab_calc, tab_science, tab_refs = st.tabs([
+        "📊 Soil Physics Logic", 
+        "🧮 Calculation Logic", 
+        "🔬 Weather Science",
+        "📚 References"
+    ])
 
 with tab_audit:
     col_a, col_b = st.columns(2)
@@ -612,22 +624,31 @@ with tab_audit:
         st.write("**Soil Constants**")
         st.write(f"Field Capacity (FC): {fc_inft:.2f} in/ft")
         st.write(f"Wilting Point (PWP): {pwp_inft:.2f} in/ft")
-        st.write(f"Available Water (AW): {aw_inft:.2f} in/ft")
+        st.write(f"Available Water (AW): {aw_per_foot:.2f} in/ft") # Updated variable
     with col_b:
         st.write("**Root Zone & Depletion**")
         st.write(f"Root Zone (RZ): {rz_ft:.2f} ft ({depth_in} in)")
-        st.write(f"Plant Available Water (PAW): {paw_inches:.2f} inches")
-        st.write(f"Allowable Depletion (AD): {allowable_depletion:.2f} inches")
-    
+        st.write(f"Plant Available Water (PAW): {paw_total:.2f} inches") # Updated variable
+        st.write(f"Allowable Depletion (AD): {ad_limit:.2f} inches") # Updated variable
+        
     st.divider()
-    depletion_status = (current_deficit / allowable_depletion) * 100 if allowable_depletion > 0 else 0
+    depletion_status = (current_deficit / ad_limit) * 100 if ad_limit > 0 else 0
     st.info(f"**Current Status:** Your deficit is {current_deficit:.2f}\". This is {depletion_status:.1f}% of your Allowable Depletion.")
 
 with tab_calc:
     st.write(f"### Soil Profile: {soil_choice}")
+    st.info("💡 **How we calculate your 'Soil Tank' capacity:**")
+    st.latex(r"AW = FC - PWP")
+    st.caption(f"Available Water: {fc_inft/12:.3f} - {pwp_inft/12:.3f} = **{aw_per_foot/12:.3f} in/in**")
+    st.latex(r"PAW = AW \times RZ")
+    st.caption(f"Plant Available Water: {aw_per_foot:.2f} in/ft × {rz_ft:.2f} ft = **{paw_total:.2f} inches**")
+    st.latex(r"AD = PAW \times MAD")
+    st.caption(f"Allowable Depletion: {paw_total:.2f} in × {mad/100:.2f} = **{ad_limit:.2f} inches**")
+    st.divider()
+    
     st.table(pd.DataFrame({
         "Parameter": ["AWC (Soil Capacity)", "Root Depth", "Total Tank Size (PAW)", "MAD (Buffer)", "Allowable Depletion (AD)"],
-        "Value": [f"{(aw_inft/12):.3f} in/in", f"{depth_in} in", f"{paw_inches:.2f} in", f"{mad}%", f"{allowable_depletion:.2f} in"]
+        "Value": [f"{(aw_per_foot/12):.3f} in/in", f"{depth_in} in", f"{paw_total:.2f} in", f"{mad}%", f"{ad_limit:.2f} in"]
     }))
     st.divider()
     st.write("### Volume & Runtime Logic")
@@ -650,6 +671,24 @@ with tab_science:
     4. **Wind:** Removes the humid layer around leaves.
     """)
     st.info("Data Source: Open-Meteo API using high-resolution weather models.")
+    
+with tab_refs:
+    st.write("### References")
+    st.markdown("""
+    **Reference:** Evaluating Field Capacity, Wilting Point, Saturation, and Plant Available Water
+    
+        Saxton, Keith S., and Walter J. Rawls. 'Estimating Soil Water 
+        Characteristics from Texture, Organic Matter, and Salinity.' *Soil Science 
+        Society of America Journal*, vol. 70, no. 5, 2006, pp. 1569-1578.
+    
+    **Reference:** FAO-56 Penman-Monteith Evaluating Evapotranspiration
+    
+        Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for 
+        Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
+    """)
+    
+    
+    
     
 #### 99. Backup Utility
 import shutil
