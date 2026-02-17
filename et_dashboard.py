@@ -5,6 +5,9 @@ import json
 import os
 import altair as alt
 from datetime import datetime
+import openmeteo_requests
+import requests_cache
+from retry_requests import retry
 
 #### 1. Page Configuration
 st.set_page_config(page_title="Irrigation Master Pro", layout="wide", page_icon="🌱")
@@ -153,6 +156,8 @@ SOIL_DATA = {
     "Clay":       {"FC": 0.459 * 12, "PWP": 3.00}
 }
 
+
+
 #### 4. SIDEBAR
 st.sidebar.header(f"📍 {active_prop} Zones")
 zone_list = list(profiles.keys())
@@ -188,6 +193,20 @@ save_col, del_col = st.sidebar.columns(2)
 if save_col.button("💾 Save Zone"):
     target_name = new_zone_name if new_zone_name.strip() != "" else selected_zone_name
     profiles[target_name] = {"area": area, "flow": flow, "soil": soil_choice, "depth": depth_in, "mad": mad}
+    if target_name not in profiles:
+        start_dt = str((datetime.now() - pd.Timedelta(days=7)).date())
+    else:
+        # Keep the existing start date if we are just updating settings
+        start_dt = profiles[target_name].get("start_date", str(datetime.now().date()))
+
+    profiles[target_name] = {
+        "area": area, 
+        "flow": flow, 
+        "soil": soil_choice, 
+        "depth": depth_in, 
+        "mad": mad,
+        "start_date": start_dt  # <--- Logic now knows when this zone "began"
+    }
     if target_name != "Default Zone" and "Default Zone" in profiles:
         del profiles["Default Zone"]
         st.toast("Placeholder 'Default Zone' removed!")
@@ -227,118 +246,135 @@ paw_inches = aw_inft * rz_ft
 # AD = PAW * MAD
 allowable_depletion = paw_inches * (mad / 100)
 
-#### 6. WEATHER ENGINE
-def archive_weather(df_daily):
-    history = {}
-    if os.path.exists(WEATHER_LOG):
-        with open(WEATHER_LOG, "r") as f: history = json.load(f)
-    for _, row in df_daily.iterrows():
-        date_str = row['time'].strftime('%Y-%m-%d')
-        if row['time'].date() <= datetime.now().date():
-            history[date_str] = {"ET0 (in)": row["ET0 (in)"], "Rain (in)": row["Rain (in)"]}
-    with open(WEATHER_LOG, "w") as f: json.dump(history, f)
+
+
+
+#### 6. WEATHER ENGINE (Integrated Open-Meteo Library)
+
+# 6.1 Setup the Open-Meteo API client with cache
+cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+openmeteo = openmeteo_requests.Client(session=retry_session)
 
 @st.cache_data(ttl=3600)
-def fetch_weather(l, n):
-    # Pull 92 days of history to maximize Open-Meteo's free tier
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={l}&longitude={n}&hourly=et0_fao_evapotranspiration,precipitation&timezone=auto&past_days=92&forecast_days=14"
+def fetch_weather_integrated(lat, lon):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ["et0_fao_evapotranspiration", "precipitation"],
+        "timezone": "auto",
+        "past_days": 92,
+        "forecast_days": 14
+    }
     try:
-        r = requests.get(url, timeout=10)
-        return r.json() if r.status_code == 200 else None
-    except:
+        responses = openmeteo.weather_api(url, params=params)
+        response = responses[0]
+        
+        # Process hourly data
+        hourly = response.Hourly()
+        et_values = hourly.Variables(0).ValuesAsNumpy()
+        precip_values = hourly.Variables(1).ValuesAsNumpy()
+
+        # Create the time range using the library's method
+        dates = pd.date_range(
+            start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+            end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
+            freq=pd.Timedelta(seconds=hourly.Interval()),
+            inclusive="left"
+        )
+
+        df_hourly = pd.DataFrame({
+            "time": dates,
+            "et0": et_values,
+            "rain": precip_values
+        })
+        
+        # Convert UTC to Local (matches the 'timezone: auto' param)
+        df_hourly['time'] = df_hourly['time'].dt.tz_convert(None) 
+        
+        # Resample to Daily and convert to Inches
+        df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
+        df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
+        df_daily['Rain (in)'] = df_daily['rain'] / 25.4
+        
+        # Critical: Strip time for comparison logic
+        df_daily['time'] = df_daily['time'].dt.normalize()
+        
+        return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
+    except Exception as e:
+        st.error(f"Weather API Error: {e}")
         return None
 
-weather = fetch_weather(lat, lon)
+# --- Execution ---
+df_api = fetch_weather_integrated(lat, lon)
 
-if weather and "hourly" in weather:
-    # --- FIXED: None-handling logic to prevent TypeError ---
-    df_api = pd.DataFrame({
-        "time": pd.to_datetime(weather["hourly"]["time"]),
-        "ET0 (in)": [v / 25.4 if v is not None else 0.0 for v in weather["hourly"]["et0_fao_evapotranspiration"]],
-        "Rain (in)": [v / 25.4 if v is not None else 0.0 for v in weather["hourly"]["precipitation"]]
-    }).set_index("time").resample('D').sum().reset_index()
-    
+if df_api is not None:
+    # 1. Archive new data to permanent storage
     archive_weather(df_api)
+    
+    # 2. Load the full history and merge with new API data
     df_permanent = load_weather_history()
     df_daily = pd.concat([df_permanent, df_api]).drop_duplicates(subset='time', keep='last').sort_values('time')
     
-    # Filter to 90 days
-    start_date = pd.to_datetime(datetime.now().date()) - pd.Timedelta(days=90)
-    df_daily = df_daily[df_daily['time'] >= start_date]
+    # 3. Ensure 'time' is normalized across the board
+    df_daily['time'] = pd.to_datetime(df_daily['time']).dt.normalize()
     
-    # --- ZONE-SPECIFIC IRRIGATION LOGS ---
+    # 4. Filter to 92 days to keep the dataframe lean
+    lookback_limit = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=92)
+    df_daily = df_daily[df_daily['time'] >= lookback_limit]
+    
+    # 5. Merge Zone-Specific Irrigation Logs
     all_logs = load_logs()
     zone_logs = all_logs.get(selected_zone_name, [])
     
     if zone_logs:
         log_df = pd.DataFrame(zone_logs)
-        log_df['time'] = pd.to_datetime(log_df['date'])
+        log_df['time'] = pd.to_datetime(log_df['date']).dt.normalize()
         log_daily = log_df.groupby('time')['inches'].sum().reset_index()
         log_daily.columns = ['time', 'Irrigation (in)']
         df_daily = pd.merge(df_daily, log_daily, on='time', how='left').fillna(0)
     else:
         df_daily['Irrigation (in)'] = 0.0
 
-    # Data Cleanup
-    df_daily['time'] = pd.to_datetime(df_daily['time']).dt.normalize()
-    for col in ["ET0 (in)", "Rain (in)", "Irrigation (in)"]:
-        df_daily[col] = pd.to_numeric(df_daily[col], errors='coerce').fillna(0.0)
-
-    # Split History and Forecast
-    today_dt = pd.Timestamp(datetime.now().date())
+    # 6. Split into History and Forecast for the UI
+    today_dt = pd.Timestamp(datetime.now().date()).normalize()
     df_history = df_daily[df_daily['time'] < today_dt].copy()
     df_forecast = df_daily[df_daily['time'] >= today_dt].copy()
 
-#### 7. DEFICIT CALCULATION
-    # Calculate the actual current deficit based on the full 90-day window
-    total_et = df_daily[df_daily['time'] <= today_dt]['ET0 (in)'].sum()
-    total_gains = df_daily[df_daily['time'] <= today_dt]['Rain (in)'].sum() + \
-                  df_daily[df_daily['time'] <= today_dt]['Irrigation (in)'].sum()
-    
-    current_deficit = max(0, total_et - total_gains)
 
-    # Calculate Core Metrics
+
+
+#### 7. DEFICIT CALCULATION (Isolated per Zone)
+    # 7.1 Determine this zone's specific starting point
+    zone_start_str = current_zone.get("start_date", str(datetime.now().date()))
+    zone_start_ts = pd.Timestamp(zone_start_str).normalize()
+    today_ts = pd.Timestamp(datetime.now().date()).normalize()
+
+    # 7.2 Filter weather data to ONLY include days since this zone started
+    # We include today (<= today_dt) to fix the "missing today" issue
+    mask = (df_daily['time'] >= zone_start_ts) & (df_daily['time'] <= today_dt)
+    zone_weather = df_daily.loc[mask]
+    
+    # 7.3 Sum losses and gains for this specific window
+    total_et = zone_weather['ET0 (in)'].sum()
+    total_rain = zone_weather['Rain (in)'].sum()
+    total_irrigation = zone_weather['Irrigation (in)'].sum()
+    
+    total_gains = total_rain + total_irrigation
+    
+    # 7.4 The Resulting Deficit
+    current_deficit = total_et - total_gains
+    
+    # Safety: Soil can't be more than "Full" (Deficit 0)
+    if current_deficit < 0:
+        current_deficit = 0.0
+
+    # 7.5 Actionable Metrics
     gallons = current_deficit * area * 0.623
     runtime = gallons / flow if flow > 0 else 0
-
-    # Smart Toggle Reset Logic
-    st.sidebar.divider()
-    st.sidebar.subheader("🔄 Soil Calibration")
-
-    # Check if a reset was already performed for THIS zone TODAY
-    today_str = str(datetime.now().date())
-    existing_reset_index = None
-    
-    # We look for any entry today where minutes == 0 (our "Reset" signature)
-    for i, entry in enumerate(zone_logs):
-        if entry.get("date") == today_str and entry.get("minutes") == 0:
-            existing_reset_index = i
-            break
-
-    if existing_reset_index is None:
-        # STATE A: No reset today -> Show the "Saturated" button
-        if st.sidebar.button("Full Reset: Soil is Saturated", help="Sets deficit to zero", use_container_width=True):
-            if current_deficit > 0:
-                # Logs 0 mins but applies exactly enough inches to zero out the deficit
-                save_log(selected_zone_name, 0, current_deficit)
-                st.rerun()
-            else:
-                st.sidebar.info("Soil is already full.")
-    else:
-        # STATE B: Reset found -> Show the "Undo" button
-        st.sidebar.warning("Soil was marked as Saturated today.")
-        if st.sidebar.button("🔙 Undo Today's Reset", type="primary", use_container_width=True):
-            all_logs = load_logs()
-            if selected_zone_name in all_logs:
-                # Remove the 0-minute entry for today from the file
-                all_logs[selected_zone_name] = [
-                    log for log in all_logs[selected_zone_name] 
-                    if not (log.get("date") == today_str and log.get("minutes") == 0)
-                ]
-                with open(LOG_FILE, "w") as f:
-                    json.dump(all_logs, f)
-                st.rerun()
         
+    
     
     
     
@@ -392,50 +428,67 @@ if weather and "hourly" in weather:
 st.divider()
 st.write(f"### 📈 Water Balance for {selected_zone_name}")
 
-if not df_daily.empty:
     # 9.2 Setup Time Window (The "Secret Sauce" that fixed the blank screen)
-    now_dt = pd.Timestamp(datetime.now().date())
-    zoom_start = now_dt - pd.Timedelta(days=7)
-    zoom_end = now_dt + pd.Timedelta(days=14)
+if not df_daily.empty:
+    now_dt = pd.Timestamp(datetime.now().date()).normalize()
+    # Calculation for the "Default View" (7 days back, 14 forward)
+    view_start = now_dt - pd.Timedelta(days=7)
+    view_end = now_dt + pd.Timedelta(days=14)
+    lookback_days = 90
+    data_start = now_dt - pd.Timedelta(days=lookback_days)
+    df_zoom = df_daily[df_daily['time'] >= data_start].copy()
     
-    # Filter the data frame first
-    df_zoom = df_daily[(df_daily['time'] >= zoom_start) & (df_daily['time'] <= zoom_end)].copy()
+    # Common X-Axis with restricted initial domain (the "Zoom")
+    x_axis = alt.X('time:T', 
+                   title='Date', 
+                   scale=alt.Scale(domain=[view_start, view_end]), # <--- This sets the initial zoom
+                   axis=alt.Axis(format='%b %d'))
 
-    # 9.3 Melt the data (This creates the legend automatically)
-    # We turn ET, Rain, and Irrigation columns into one 'Inches' column and one 'Type' label column
-    df_melted = df_zoom.melt(
-        id_vars=['time'], 
-        value_vars=['ET0 (in)', 'Rain (in)', 'Irrigation (in)'], 
-        var_name='Type', 
-        value_name='Inches'
+    # --- 9.3 Create a Layered Chart (Bars for Water In, Line for Water Out) ---
+    
+    # 1. ET Line (Water Loss)
+    et_chart = alt.Chart(df_zoom).mark_line(strokeWidth=3, color='#FF8C00').encode(
+        x=alt.X('time:T', title='Date'),
+        y=alt.Y('ET0 (in):Q', title='Inches'),
+        tooltip=['time:T', 'ET0 (in):Q']
     )
 
-    # 9.4 Create the Chart
-    # By encoding 'Type' to Color, Altair builds the legend for us.
-    main_chart = alt.Chart(df_melted).mark_line(strokeWidth=3).encode(
-        x=alt.X('time:T', title='Date', axis=alt.Axis(format='%b %d')),
-        y=alt.Y('Inches:Q', title='Inches'),
-        color=alt.Color('Type:N', 
-            scale=alt.Scale(
-                domain=['ET0 (in)', 'Rain (in)', 'Irrigation (in)'],
-                range=['#FF8C00', '#ADD8E6', '#003366']
-            ),
-            legend=alt.Legend(orient="top", title=None)
-        ),
-        tooltip=['time:T', 'Type:N', 'Inches:Q']
+    # 2. Rain Bars (Water Gain)
+    rain_chart = alt.Chart(df_zoom).mark_bar(opacity=0.5, color='#ADD8E6').encode(
+        x='time:T',
+        y='Rain (in):Q',
+        tooltip=['time:T', 'Rain (in):Q']
     )
 
-    # The Red "Today" Line
+    # 3. Irrigation Bars (Water Gain)
+    irr_chart = alt.Chart(df_zoom).mark_bar(size=10, color='#003366').encode(
+        x='time:T',
+        y='Irrigation (in):Q',
+        tooltip=['time:T', 'Irrigation (in):Q']
+    )
+
+    # 4. Today Marker
     today_line = alt.Chart(pd.DataFrame({'time': [now_dt]})).mark_rule(
         color='red', strokeDash=[5,5], strokeWidth=2
     ).encode(x='time:T')
 
-    # Combine and Display
-    final_chart = (main_chart + today_line).properties(
+    # Combine all layers
+    # .interactive(bind_y=False) allows scrolling through time without messsing up the Y axis scale
+    final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
         height=400
-    ).interactive()
+    ).interactive(bind_y=False)
 
     st.altair_chart(final_chart, use_container_width=True)
+
+# Legend Key (Centered)
+    st.markdown("""
+    <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
+        <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
+        <div><span style="color:#ADD8E6; font-weight:bold;">▇</span> Rain (Gain)</div>
+        <div><span style="color:#003366; font-weight:bold;">▇</span> Irrigation (Gain)</div>
+        <div><span style="color:red; font-weight:bold;">---</span> Today</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     #### 9.5 Data Tables
     tab1, tab2 = st.tabs(["🗓️ Forecast (Next 14 Days)", "📜 History (Past 90 Days)"])
