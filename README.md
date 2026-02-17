@@ -1,6 +1,6 @@
 # 🌱 Irrigation Dashboard
 
-Irrigation Master Pro is a localized Evapotranspiration (ET) dashboard that helps you manage lawn and garden watering with precision. By pulling real-time weather data and calculating soil moisture depletion, it tells you exactly **when** to water and **how much** to apply.
+Irrigation Dashboard is a localized Evapotranspiration (ET) dashboard that helps you manage lawn and garden watering with precision. By pulling real-time weather data and calculating soil moisture depletion, it tells you exactly **when** to water and **how much** to apply.
 
 ## 🚀 Quick Start (Windows)
 
