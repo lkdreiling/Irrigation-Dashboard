@@ -29,5 +29,24 @@ The system uses three core components to calculate your irrigation needs:
 * **Zone Profiles:** Set your square footage and GPM (Gallons Per Minute) for accurate runtime calculations.
 * **Backups:** Use the "Data Security" tab at the bottom of the dashboard to create instant backups of your data.
 
+## 🎨 Make it an App (Optional)
+
+To give the **Irrigation Dashboard** a professional look on your Windows desktop, follow these steps to create a custom shortcut using the provided emblem:
+
+1. **Create the Shortcut**:
+   - Navigate to your project folder.
+   - Right-click `run_dashboard.bat` and select **Send to** > **Desktop (create shortcut)**.
+
+2. **Apply the Icon**:
+   - Go to your Desktop and right-click the new shortcut.
+   - Select **Properties**.
+   - Under the **Shortcut** tab, click the **Change Icon...** button.
+   - Click **Browse** and navigate to the `Misc/` folder in your project directory.
+   - Select the `emblem.ico` file and click **Open**, then **OK**.
+
+3. **Final Polish**:
+   - Rename the shortcut to **Irrigation Dashboard**.
+   - (Optional) Pin it to your Taskbar or Start Menu for one-click access.
+
 ---
 *Developed for smart water management and healthy landscapes.*
