@@ -1,5 +1,5 @@
 @echo off
-:: This moves the command window to your C:\Weather folder
+:: This moves the command window to your F:\Weather folder
 cd /d F:\Weather
 
 :: This tells Windows where to find your Anaconda tools
