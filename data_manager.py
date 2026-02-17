@@ -1,15 +1,17 @@
 import os
 import json
 
+# 1. Define the paths FIRST
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "IrrigationData")
 SYSTEM_DIR = os.path.join(DATA_DIR, "SystemData")
 BACKUP_DIR = os.path.join(BASE_DIR, "Backups")
 
-# Create directories on startup
+# 2. Now that the names exist, create the directories
 for folder in [DATA_DIR, SYSTEM_DIR, BACKUP_DIR]:
     os.makedirs(folder, exist_ok=True)
 
+# 3. Define file paths using those directories
 PROP_LIST_FILE = os.path.join(SYSTEM_DIR, "properties.json")
 
 def load_json(path, default):
