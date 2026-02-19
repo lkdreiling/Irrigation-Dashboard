@@ -9,6 +9,7 @@ from datetime import datetime
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
+import numpy as np
 
 #### 1. Page Configuration
 st.set_page_config(page_title="Irrigation Dashboard", layout="wide", page_icon="🌱")
@@ -25,7 +26,8 @@ st.title("🌱 Irrigation Dashboard")
 
 from data_manager import (
     load_json, save_json, get_prop_paths, 
-    PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR  # <--- Make sure SYSTEM_DIR is here
+    PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR,  # <--- Make sure SYSTEM_DIR is here
+    save_properties_master  
 )
 from core_logic import SOIL_DATA, get_coords, calculate_irrigation_limits
 
@@ -321,70 +323,90 @@ if df_api is not None:
 
 
 
-#### 7. DEFICIT CALCULATION (Isolated per Zone)
-    # 7.1 Determine this zone's specific starting point
-    zone_start_str = current_zone.get("start_date", str(datetime.now().date()))
-    zone_start_ts = pd.Timestamp(zone_start_str).normalize()
-    today_ts = pd.Timestamp(datetime.now().date()).normalize()
+#### 7. DEFICIT CALCULATION (Sequential Water Balance Model)
+# 7.1 Determine this zone's specific starting point
+zone_start_str = current_zone.get("start_date", str(datetime.now().date()))
+zone_start_ts = pd.Timestamp(zone_start_str).normalize()
+today_ts = pd.Timestamp(datetime.now().date()).normalize()
 
-    # 7.2 Filter weather data to ONLY include days since this zone started
-    # We include today (<= today_dt) to fix the "missing today" issue
-    mask = (df_daily['time'] >= zone_start_ts) & (df_daily['time'] <= today_dt)
-    zone_weather = df_daily.loc[mask]
-    
-    # 7.3 Sum losses and gains for this specific window
-    total_et = zone_weather['ET0 (in)'].sum()
-    total_rain = zone_weather['Rain (in)'].sum()
-    total_irrigation = zone_weather['Irrigation (in)'].sum()
-    
-    total_gains = total_rain + total_irrigation
-    
-    # 7.4 The Resulting Deficit
-    current_deficit = total_et - total_gains
-    
-    # Safety: Soil can't be more than "Full" (Deficit 0)
-    if current_deficit < 0:
-        current_deficit = 0.0
+# 7.2 Filter weather data for this zone's lifespan
+mask = (df_daily['time'] >= zone_start_ts) & (df_daily['time'] <= today_ts)
+zone_weather = df_daily.loc[mask].sort_values('time')
 
-    # 7.5 Actionable Metrics
-    gallons = current_deficit * area * 0.623
-    runtime = gallons / flow if flow > 0 else 0
+# 7.25 NEW: Get Drainage Constant from Core Logic ---
+soil_info = SOIL_DATA.get(soil_choice, SOIL_DATA["Loam"])
+drain_days = soil_info.get("DrainDays", 2.0)
+# This calculates how much water stays in the soil each day (Decay Factor)
+# e.g., if drain_days = 2, drain_factor = 0.5 (loses half per day)
+drain_factor = 1.0 - (1.0 / drain_days) if drain_days > 1 else 0.0
+
+# 7.3 Running Balance Loop
+# We start at 0 (Field Capacity) on the zone's start date
+running_deficit = 0.0 
+
+for _, row in zone_weather.iterrows():
+    daily_et = row.get('ET0 (in)', 0)
+    daily_rain = row.get('Rain (in)', 0)
+    daily_irr = row.get('Irrigation (in)', 0)
+    
+    # Update balance: Add loss, subtract gains
+    running_deficit += (daily_et - daily_rain - daily_irr)
+    
+    # 7.4 Saturation & Drainage Logic (2-Day Reset)
+    # If deficit is negative, soil is supersaturated.
+    # We drain 50% of the excess water per day toward Field Capacity (0)
+    if running_deficit < 0:
+        running_deficit = running_deficit * drain_factor 
         
+        # If the excess is negligible (less than a drop), just call it 0
+        if abs(running_deficit) < 0.001:
+            running_deficit = 0.0
+
+# 7.5 Final Output Variables
+current_deficit = max(0.0, running_deficit) # We don't want to suggest "negative" watering
+gallons = current_deficit * area * 0.623
+runtime = gallons / flow if flow > 0 else 0
+
+# For the audit tab to show totals correctly
+total_et = zone_weather['ET0 (in)'].sum()
+total_rain = zone_weather['Rain (in)'].sum()
+total_irrigation = zone_weather['Irrigation (in)'].sum()
+   
     
     
     
     
 #### 8. Dashboard Metrics
-    st.markdown(f"### {active_prop} : {selected_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
-    st.divider()
-    seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum()
-    seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum()
-    today_et = df_forecast.iloc[0]['ET0 (in)']
-    today_rain = df_forecast.iloc[0]['Rain (in)']
-    m1, m2, m3, m4 = st.columns(4)
+st.markdown(f"### {active_prop} : {selected_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
+st.divider()
+seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum()
+seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum()
+today_et = df_forecast.iloc[0]['ET0 (in)']
+today_rain = df_forecast.iloc[0]['Rain (in)']
+m1, m2, m3, m4 = st.columns(4)
     
     # Metric 3 is now 7-Day ET
-    m3.metric("7-Day ET Forecast", f"{seven_day_et:.2f}\"", delta=f"Today: {today_et:.2f}\"", delta_color="inverse")
+m3.metric("7-Day ET Forecast", f"{seven_day_et:.2f}\"", delta=f"Today: {today_et:.2f}\"", delta_color="inverse")
     
     # Metric 4 7-Day Rain
-    m4.metric("7-Day Rain Forecast", f"{seven_day_rain:.2f}\"", delta=f"Today: {today_rain:.2f}\"")
+m4.metric("7-Day Rain Forecast", f"{seven_day_rain:.2f}\"", delta=f"Today: {today_rain:.2f}\"")
     
     # Metric 1 is now the Water to Apply (Depth, Time, and Vol)
-    m1.metric("Water to Apply", f"{ current_deficit:.2f}\"", 
+m1.metric("Water to Apply", f"{ current_deficit:.2f}\"", 
               delta=f"{runtime:.1f} min ({gallons:.0f} gal)")
      
     # Metric 2: Allowable Depletion & Status Arrow [Logic: If deficit is less than AD, we are "OK" (Green). If deficit > AD, we are "Over" (Red).]
     # UPDATE: Changed allowable_depletion to ad_limit
-    if current_deficit < ad_limit:
+if current_deficit < ad_limit:
         status_msg = "Wait to Apply"
         d_val = "OK"
         d_color = "normal" # Shows Green
-    else:
+else:
         status_msg = "Water Needed"
         d_val = "LOW"
         d_color = "inverse" # Shows Red
 
-    m2.metric(
+m2.metric(
         label="Allowable Depletion", 
         value=f"{ad_limit:.2f}\"", 
         delta=status_msg, 
@@ -392,11 +414,11 @@ if df_api is not None:
     )
   
     # Guidance Logic based on Forecast
-    if seven_day_rain >  current_deficit and  current_deficit > 0:
+if seven_day_rain >  current_deficit and  current_deficit > 0:
         st.warning(f"🌧️ **Rain is coming:** The 7-day forecast shows **{seven_day_rain:.2f}\"** of rain. You may want to skip watering today!")
-    elif  current_deficit <= 0:
+elif  current_deficit <= 0:
         st.success(f"✅ **Soil is Hydrated!**")
-    else:
+else:
         st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill the profile.")
   
   
@@ -611,9 +633,10 @@ else:
 #### 11. Math & Science Expander
 st.divider()
 with st.expander("📚 Reference, Math & Science Methodology", expanded=False):
-    tab_audit, tab_calc, tab_science, tab_refs = st.tabs([
+    tab_audit, tab_calc, tab_phys, tab_science, tab_refs = st.tabs([
         "📊 Soil Physics Logic", 
         "🧮 Calculation Logic", 
+        "🧬 Soil Moisture Release Curve",
         "🔬 Weather Science",
         "📚 References"
     ])
@@ -637,7 +660,16 @@ with tab_audit:
 
 with tab_calc:
     st.write(f"### Soil Profile: {soil_choice}")
-    st.info("💡 **How we calculate your 'Soil Tank' capacity:**")
+    
+    # --- Drainage & Saturation Logic Explanation ---   
+    st.markdown(f"""
+    When soil moisture exceeds Field Capacity (e.g., heavy rain), it enters a **Saturation** state. 
+    Excess water drains via gravity at a rate determined by the soil texture:
+    * **Current Drainage Rate:** {((1-drain_factor)*100):.0f}% of excess water removed per day.
+    * **Time to FC:** {drain_days} day(s).
+    """)
+    st.divider()
+    
     st.latex(r"AW = FC - PWP")
     st.caption(f"Available Water: {fc_inft/12:.3f} - {pwp_inft/12:.3f} = **{aw_per_foot/12:.3f} in/in**")
     st.latex(r"PAW = AW \times RZ")
@@ -658,6 +690,27 @@ with tab_calc:
     3. **Runtime:** {gallons:.1f} gal / {flow} GPM = **{runtime:.1f} Minutes**
     """)
 
+with tab_phys:
+    st.write(f"### Van Genuchten Retention Curve: {soil_choice}")
+    v = SOIL_DATA[soil_choice]
+    h_cm = np.logspace(0, 5, 100) # Suction from 1 to 100,000 cm
+    
+    # VG Equation: theta = theta_r + (theta_s - theta_r) / [1 + (alpha * h)^n]^m
+    m = 1 - (1/v['n'])
+    theta = v['theta_r'] + (v['theta_s'] - v['theta_r']) / (1 + (v['alpha'] * h_cm)**v['n'])**m
+    
+    curve_df = pd.DataFrame({"Suction (cm)": h_cm, "Water Content (vol)": theta})
+    
+    line_chart = alt.Chart(curve_df).mark_line(color='#2E8B57').encode(
+        x=alt.X('Suction (cm):Q', scale=alt.Scale(type='log'), title='Matric Suction (cm, log scale)'),
+        y=alt.Y('Water Content (vol):Q', title='Volumetric Water Content (cm³/cm³)')
+    ).properties(height=300)
+    
+    st.altair_chart(line_chart, use_container_width=True)
+    st.latex(r"\theta(h) = \theta_r + \frac{\theta_s - \theta_r}{[1 + (\alpha h)^n]^m}")
+    st.caption(f"Parameters for {soil_choice}: α={v['alpha']}, n={v['n']}, θr={v['theta_r']}, θs={v['theta_s']}")
+
+
 with tab_science:
     st.write("### Evapotranspiration (ET₀) Explained")
     
@@ -675,16 +728,26 @@ with tab_science:
 with tab_refs:
     st.write("### References")
     st.markdown("""
-    **Reference:** Evaluating Field Capacity, Wilting Point, Saturation, and Plant Available Water
+    Evaluating Field Capacity, Wilting Point, Saturation, and Plant Available Water
     
         Saxton, Keith S., and Walter J. Rawls. 'Estimating Soil Water 
         Characteristics from Texture, Organic Matter, and Salinity.' *Soil Science 
         Society of America Journal*, vol. 70, no. 5, 2006, pp. 1569-1578.
     
-    **Reference:** FAO-56 Penman-Monteith Evaluating Evapotranspiration
+    Soil Data 
+    
+        Rosetta Class Average Hydraulic Parameters. *USDA Salinity Laboratory*, 1999.
+    
+    FAO-56 Penman-Monteith Evaluating Evapotranspiration
     
         Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for 
         Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
+    
+    Soil Moisture Release Curve
+    
+        Van Genuchten, Martinus Th. "A Closed-form Equation for Predicting the Hydraulic Conductivity 
+        of Unsaturated Soils." *Soil Science Society of America Journal*, vol. 44, no. 5, 1980, pp. 892-898. 
+        [Download PDF](https://acsess.onlinelibrary.wiley.com/doi/pdf/10.2136/sssaj1980.03615995004400050007x)  
     """)
     
     
@@ -717,3 +780,4 @@ with st.expander("🛡️ Data Security & Backups"):
             st.error(f"Backup failed: {e}")
 
     st.caption("Note: This creates a local copy on your machine. For extra safety, copy the 'Backups' folder to a cloud drive.")
+
