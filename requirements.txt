@@ -5,3 +5,4 @@ openmeteo-requests
 requests-cache
 retry-requests
 requests
+numpy
