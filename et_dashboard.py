@@ -25,7 +25,8 @@ st.title("🌱 Irrigation Dashboard")
 
 from data_manager import (
     load_json, save_json, get_prop_paths, 
-    PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR  # <--- Make sure SYSTEM_DIR is here
+    PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR,  # <--- Make sure SYSTEM_DIR is here
+    save_properties_master  
 )
 from core_logic import SOIL_DATA, get_coords, calculate_irrigation_limits
 
