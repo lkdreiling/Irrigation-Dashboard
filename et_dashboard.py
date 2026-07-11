@@ -9,8 +9,18 @@ from datetime import datetime
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
+from datetime import timedelta
 
-#### 1. Page Configuration
+
+#### 1.0 IMPORT YOUR CUSTOM MODULES  
+from data_manager import (
+    load_json, save_json, get_prop_paths, 
+    PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR,  
+    save_properties_master  
+)
+from core_logic import SOIL_DATA, get_coords, calculate_irrigation_limits
+
+#### 1.1 Page Configuration
 st.set_page_config(page_title="Irrigation Dashboard", layout="wide", page_icon="🌱")
 st.markdown("""
     <style>
@@ -23,16 +33,26 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.title("🌱 Irrigation Dashboard")
 
-from data_manager import (
-    load_json, save_json, get_prop_paths, 
-    PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR  # <--- Make sure SYSTEM_DIR is here
-)
-from core_logic import SOIL_DATA, get_coords, calculate_irrigation_limits
+#### 1.2 User location
+# --- TRACKING VISITOR IP FOR LOCAL ZIP ---
+@st.cache_data(ttl=86400)  # Cache for 24 hours so it doesn't spam the API on every click
+def get_visitor_zip():
+    try:
+        # Uses a free, secure geo-IP service that reads the user's browser connection
+        response = requests.get("https://ipapi.co/json/", timeout=3).json()
+        detected_zip = response.get("postal")
+        if detected_zip and len(detected_zip) == 5:
+            return str(detected_zip)
+    except Exception:
+        pass
+    return "66502"  # Reliable fallback (Manhattan, KS) if they block location tracking
 
+# Automatically fetch the manager's local zip code on load
+default_local_zip = get_visitor_zip()
 
-# Initialize Session State
+# Initialize Session State using their local zip code dynamically
 if 'prop_master' not in st.session_state:
-    st.session_state.prop_master = load_json(PROP_LIST_FILE, {"Home": "48892"})
+    st.session_state.prop_master = load_json(PROP_LIST_FILE, {"Home": default_local_zip})
 
 # --- TOP NAVIGATION: Dropdown & Settings ---
 head_col1, head_col2 = st.columns([3, 1])
@@ -42,7 +62,7 @@ with head_col1:
     prop_names = list(st.session_state.prop_master.keys())
     active_prop = st.selectbox("Select Property", prop_names, label_visibility="collapsed")
     # Get the zip associated with that property name
-    active_zip = st.session_state.prop_master.get(active_prop, "48892")
+    active_zip = st.session_state.prop_master.get(active_prop, "default_local_zip")
 
 with head_col2:
     with st.popover("⚙️ Property Settings"):
@@ -88,7 +108,19 @@ def load_profiles():
         try:
             with open(DB_FILE, "r") as f: return json.load(f)
         except: pass
-    return {"Default Zone": {"zip": "48892", "area": 1000, "flow": 5.0, "soil": "Loam", "depth": 12, "mad": 50}}
+    # --- PRE-MAKE 12 DEFAULT ZONES ---
+    # Generates a standard baseline layout so managers don't have to build it manually
+    default_twelve_zones = {}
+    for i in range(1, 13):
+        default_twelve_zones[f"Zone {i}"] = {
+            "zip": active_zip, 
+            "area": 2000,   # Now a clean whole number
+            "flow": 20,      # Now a clean whole number
+            "soil": "Loam", 
+            "depth": 12, 
+            "mad": 50
+        }   
+    return default_twelve_zones
 
 def save_profiles(p):
     with open(DB_FILE, "w") as f: json.dump(p, f)
@@ -130,22 +162,67 @@ profiles = load_profiles()
 
 
 
-
-
-
-#### 4. SIDEBAR
+#### 4. ZONE SELECTION & MANAGEMENT
 st.sidebar.header(f"📍 {active_prop} Zones")
-zone_list = list(profiles.keys())
-selected_zone_name = st.sidebar.selectbox("Select Active Zone", zone_list)
-current_zone = profiles.get(selected_zone_name, profiles[zone_list[0]])
 
-# Input for creating a new zone name
-new_zone_name = st.sidebar.text_input("New Zone Name (Optional)", placeholder="e.g. Backyard")
+# 1. Extract the current zones from profiles
+zone_list = list(profiles.keys())
+
+# Create layout inside the sidebar for the selection widget and option settings
+# This keeps everything neatly grouped together on the left panel
+zone_col1, zone_col2 = st.sidebar.columns([3, 1]) 
+
+with zone_col1:
+    # Main Dropdown Menu - now locked inside the sidebar
+    active_zone_name = st.selectbox("Select Active Zone", zone_list, label_visibility="visible")
+    current_zone = profiles[active_zone_name]
+
+with zone_col2:
+    # Add spacing to align vertically with the sidebar selectbox label
+    st.write(" ")
+    st.write(" ")
+    with st.popover("⚙️"):
+        st.subheader("📝 Rename This Zone")
+        new_zone_name_input = st.text_input("New Name", value=active_zone_name, key="rename_input")
+        
+        if st.button("Save Name", use_container_width=True):
+            if new_zone_name_input and new_zone_name_input != active_zone_name:
+                profiles[new_zone_name_input] = profiles.pop(active_zone_name)
+                
+                logs = load_logs()
+                if active_zone_name in logs:
+                    logs[new_zone_name_input] = logs.pop(active_zone_name)
+                    with open(LOG_FILE, "w") as f: 
+                        json.dump(logs, f)
+                
+                save_profiles(profiles)
+                st.success(f"Renamed to {new_zone_name_input}!")
+                st.rerun()
+
+        st.divider()
+        st.subheader("➕ Add Extra Zone")
+        custom_new_zone = st.text_input("Zone Name (e.g., Zone 13)", key="add_input")
+        
+        if st.button("Create Zone", use_container_width=True, type="primary"):
+            if custom_new_zone and custom_new_zone not in profiles:
+                profiles[custom_new_zone] = {
+                    "zip": active_zip,
+                    "area": 1000,
+                    "flow": 5,
+                    "soil": "Loam",
+                    "depth": 12,
+                    "mad": 50
+                }
+                save_profiles(profiles)
+                st.success(f"{custom_new_zone} added!")
+                st.rerun()
+            elif custom_new_zone in profiles:
+                st.error("A zone with that name already exists.")
+  
 
 @st.cache_data(ttl=3600)
 def get_coords(zip_code):
     try:
-        # Uses the active_zip from the Property Settings at the top
         res = requests.get(f"http://api.zippopotam.us/us/{zip_code}", timeout=5).json()
         return float(res['places'][0]['latitude']), float(res['places'][0]['longitude']), f"{res['places'][0]['place name']}"
     except: 
@@ -153,61 +230,79 @@ def get_coords(zip_code):
 
 lat, lon, z_name = get_coords(active_zip)
 
+# --- IRRIGATION SPECIFICATIONS ---
+# --- IRRIGATION SPECIFICATIONS (AUTO-SAVING) ---
 st.sidebar.header("💧 Irrigation Specs")
-area = st.sidebar.number_input("Zone Area (sq ft)", value=float(current_zone.get("area", 1000)))
-flow = st.sidebar.number_input("Zone Flow (GPM)", value=float(current_zone.get("flow", 5.0)))
-soil_types = list(SOIL_DATA.keys())
+
+# 1. Grab values, falling back to clean defaults if they don't exist yet
+current_area = int(current_zone.get("area", 1000))
+current_flow = int(current_zone.get("flow", 5))
 saved_soil = current_zone.get("soil", "Loam")
+current_depth = int(current_zone.get("depth", 12))
+current_mad = int(current_zone.get("mad", 50))
+current_start_dt = current_zone.get("start_date", str(datetime.now().date()))
+
+# 2. Render UI widgets. Any user interaction instantly updates the variable.
+area = st.sidebar.number_input("Zone Area (sq ft)", min_value=1, value=current_area, step=1, format="%d")
+flow = st.sidebar.number_input("Zone Flow (GPM)", min_value=1, value=current_flow, step=1, format="%d")
+
+soil_types = list(SOIL_DATA.keys())
 try:
     soil_index = soil_types.index(saved_soil)
 except ValueError:
-    soil_index = soil_types.index("Loam") # Fallback if name mismatch
-
+    soil_index = soil_types.index("Loam")
 soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
-# -------------------------
 
-depth_in = st.sidebar.slider("Root Depth (in)", 4, 36, int(current_zone.get("depth", 12)))
-mad = st.sidebar.slider("MAD (%)", 10, 60, int(current_zone.get("mad", 50)))
+depth_in = st.sidebar.slider("Root Depth (in)", 4, 36, current_depth)
+mad = st.sidebar.slider("MAD (%)", 10, 60, current_mad)
 
-save_col, del_col = st.sidebar.columns(2)
-if save_col.button("💾 Save Zone"):
-    target_name = new_zone_name if new_zone_name.strip() != "" else selected_zone_name
-    profiles[target_name] = {"area": area, "flow": flow, "soil": soil_choice, "depth": depth_in, "mad": mad}
-    if target_name not in profiles:
-        start_dt = str((datetime.now() - pd.Timedelta(days=7)).date())
-    else:
-        # Keep the existing start date if we are just updating settings
-        start_dt = profiles[target_name].get("start_date", str(datetime.now().date()))
-
-    profiles[target_name] = {
+# 3. AUTO-SAVE CHECK: Compare current inputs against what is saved in the file
+if (area != current_area or 
+    flow != current_flow or 
+    soil_choice != saved_soil or 
+    depth_in != current_depth or 
+    mad != current_mad):
+    
+    # Pack the fresh entries up
+    profiles[active_zone_name] = {
+        "zip": active_zip,
         "area": area, 
         "flow": flow, 
         "soil": soil_choice, 
         "depth": depth_in, 
         "mad": mad,
-        "start_date": start_dt  # <--- Logic now knows when this zone "began"
+        "start_date": current_start_dt  
     }
-    if target_name != "Default Zone" and "Default Zone" in profiles:
+    
+    # Quietly drop the placeholder if they edited the default settings
+    if active_zone_name != "Default Zone" and "Default Zone" in profiles:
         del profiles["Default Zone"]
-        st.toast("Placeholder 'Default Zone' removed!")
+        
     save_profiles(profiles)
-    st.rerun()
+    st.rerun() # Refresh layout instantly to update downstream ET calculations
 
-if del_col.button("🗑️ Delete Zone", type="secondary"):
+# 4. CLEAN DELETE INTERFACE
+# Since save is gone, delete just needs a full column width to sit cleanly
+if st.sidebar.button("🗑️ Delete This Zone", use_container_width=True, type="secondary"):
     if len(profiles) > 1:
-        del profiles[selected_zone_name]
+        del profiles[active_zone_name]
         save_profiles(profiles)
         st.rerun()
-    else: st.error("Cannot delete last zone.")
+    else: 
+        st.error("Cannot delete last zone.")
     
 st.sidebar.divider()
+
+# --- WATER LOGGING MANAGEMENT ---
 st.sidebar.header("📝 Log a Watering Event")
 run_mins = st.sidebar.number_input("Actual Runtime (min)", min_value=0.0, step=1.0)
+
 if st.sidebar.button("Add to History"):
     applied_inches = (run_mins * flow) / (area * 0.623)
-    save_log(selected_zone_name, run_mins, applied_inches)
+    save_log(active_zone_name, run_mins, applied_inches)
     st.sidebar.success(f"Logged {applied_inches:.2f}\" applied!")
     st.rerun()
+
 
 
 
@@ -233,57 +328,85 @@ retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
 
 @st.cache_data(ttl=3600)
-def fetch_weather_integrated(lat, lon):
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": ["et0_fao_evapotranspiration", "precipitation"],
-        "timezone": "auto",
-        "past_days": 92,
-        "forecast_days": 14
-    }
+def fetch_weather_integrated(lat, lon, start_date_str):
+    start_dt = pd.to_datetime(start_date_str).date()
+    today = datetime.now().date()
+    days_back = (today - start_dt).days
+    
+    # 6.11 Determine correct endpoint and parameter mapping based on range requirements
+    if days_back > 90:
+        url = "https://archive-api.open-meteo.com/v1/archive"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": str(start_dt),
+            "end_date": str(today),
+            "daily": ["et0_fao56", "precipitation"],
+            "timezone": "auto",
+            "wind_speed_unit": "mph",
+            "precipitation_unit": "inch"
+        }
+        is_hourly = False
+    else:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": ["et0_fao_evapotranspiration", "precipitation"],
+            "timezone": "auto",
+            "past_days": 92,
+            "forecast_days": 14
+        }
+        is_hourly = True
     try:
         responses = openmeteo.weather_api(url, params=params)
         response = responses[0]
         
-        # Process hourly data
-        hourly = response.Hourly()
-        et_values = hourly.Variables(0).ValuesAsNumpy()
-        precip_values = hourly.Variables(1).ValuesAsNumpy()
-
-        # Create the time range using the library's method
-        dates = pd.date_range(
-            start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
-            end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
-            freq=pd.Timedelta(seconds=hourly.Interval()),
-            inclusive="left"
-        )
-
-        df_hourly = pd.DataFrame({
-            "time": dates,
-            "et0": et_values,
-            "rain": precip_values
-        })
-        
-        # Convert UTC to Local (matches the 'timezone: auto' param)
-        df_hourly['time'] = df_hourly['time'].dt.tz_convert(None) 
-        
-        # Resample to Daily and convert to Inches
-        df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
-        df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
-        df_daily['Rain (in)'] = df_daily['rain'] / 25.4
-        
-        # Critical: Strip time for comparison logic
+        # 2. Extract arrays based on endpoint format definitions
+        if is_hourly:
+            hourly = response.Hourly()
+            et_values = hourly.Variables(0).ValuesAsNumpy()
+            precip_values = hourly.Variables(1).ValuesAsNumpy()
+            
+            dates = pd.date_range(
+                start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+                end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
+                freq=pd.Timedelta(seconds=hourly.Interval()),
+                inclusive="left"
+            )
+            df_hourly = pd.DataFrame({"time": dates, "et0": et_values, "rain": precip_values})
+            df_hourly['time'] = df_hourly['time'].dt.tz_convert(None) 
+            
+            # Convert hourly metric variables down to daily inches
+            df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
+            df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
+            df_daily['Rain (in)'] = df_daily['rain'] / 25.4
+        else:
+            daily = response.Daily()
+            et_values = daily.Variables(0).ValuesAsNumpy()
+            precip_values = daily.Variables(1).ValuesAsNumpy()
+            
+            dates = pd.date_range(
+                start=pd.to_datetime(daily.Time(), unit="s", utc=True),
+                end=pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
+                freq=pd.Timedelta(seconds=daily.Interval()),
+                inclusive="left"
+            )
+            df_daily = pd.DataFrame({"time": dates, "ET0 (in)": et_values, "Rain (in)": precip_values})
+            df_daily['time'] = df_daily['time'].dt.tz_convert(None)
+            
         df_daily['time'] = df_daily['time'].dt.normalize()
-        
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
+        
     except Exception as e:
         st.error(f"Weather API Error: {e}")
         return None
 
 # --- Execution ---
-df_api = fetch_weather_integrated(lat, lon)
+# Map the request check dynamically to the activation timestamp of the current zone
+zone_start_date_str = current_zone.get("start_date", str(datetime.now().date() - pd.Timedelta(days=7)))
+
+df_api = fetch_weather_integrated(lat, lon, zone_start_date_str)
 
 if df_api is not None:
     # 1. Archive new data to permanent storage
@@ -296,13 +419,14 @@ if df_api is not None:
     # 3. Ensure 'time' is normalized across the board
     df_daily['time'] = pd.to_datetime(df_daily['time']).dt.normalize()
     
-    # 4. Filter to 92 days to keep the dataframe lean
-    lookback_limit = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=92)
-    df_daily = df_daily[df_daily['time'] >= lookback_limit]
+    # 4. FIXED: Retain all historical entries up to the zone activation threshold 
+    # instead of cutting the data frame down to a hard 92-day count limit
+    earliest_allowed_date = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=180)
+    df_daily = df_daily[df_daily['time'] >= earliest_allowed_date]
     
     # 5. Merge Zone-Specific Irrigation Logs
     all_logs = load_logs()
-    zone_logs = all_logs.get(selected_zone_name, [])
+    zone_logs = all_logs.get(active_zone_name, [])
     
     if zone_logs:
         log_df = pd.DataFrame(zone_logs)
@@ -355,7 +479,7 @@ if df_api is not None:
     
     
 #### 8. Dashboard Metrics
-    st.markdown(f"### {active_prop} : {selected_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
+    st.markdown(f"### {active_prop} : {active_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
     st.divider()
     seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum()
     seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum()
@@ -374,13 +498,12 @@ if df_api is not None:
               delta=f"{runtime:.1f} min ({gallons:.0f} gal)")
      
     # Metric 2: Allowable Depletion & Status Arrow [Logic: If deficit is less than AD, we are "OK" (Green). If deficit > AD, we are "Over" (Red).]
-    # UPDATE: Changed allowable_depletion to ad_limit
     if current_deficit < ad_limit:
-        status_msg = "Wait to Apply"
+        status_msg = "✋ Wait to Water"
         d_val = "OK"
-        d_color = "normal" # Shows Green
+        d_color = "normal"  # Shows Green arrow pointing up/stable status
     else:
-        status_msg = "Water Needed"
+        status_msg = "💧 Time to Water!"
         d_val = "LOW"
         d_color = "inverse" # Shows Red
 
@@ -405,7 +528,7 @@ if df_api is not None:
 #### 9.1 Graphs & Tables
 st.divider()
 with st.expander("📈 View Water Balance Graph", expanded=True):
-    st.write(f"### 📈 Water Balance for {selected_zone_name}")
+    st.write(f"### 📈 Water Balance for {active_zone_name}")
 
     # 9.2 Setup Time Window (The "Secret Sauce" that fixed the blank screen)
     if not df_daily.empty:
@@ -413,7 +536,7 @@ with st.expander("📈 View Water Balance Graph", expanded=True):
     # Calculation for the "Default View" (7 days back, 14 forward)
     view_start = now_dt - pd.Timedelta(days=7)
     view_end = now_dt + pd.Timedelta(days=14)
-    lookback_days = 90
+    lookback_days = 180  # Updated to display up to 180 days of history on the chart timeline
     data_start = now_dt - pd.Timedelta(days=lookback_days)
     df_zoom = df_daily[df_daily['time'] >= data_start].copy()
     
