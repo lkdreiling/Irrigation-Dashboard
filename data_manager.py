@@ -32,6 +32,7 @@ def get_prop_paths(active_prop):
         "weather": os.path.join(SYSTEM_DIR, f"{active_prop}_weather.json")
     }
 
-def save_properties_master(prop_data):
-    """Saves the master property dictionary (Property Name: Zip Code)"""
-    save_json(PROP_LIST_FILE, prop_data)
+def save_properties_master(prop_dict):
+    """Saves the master property list and their zip codes to the JSON file."""
+    with open(PROP_LIST_FILE, "w") as f:
+        json.dump(prop_dict, f, indent=4)
