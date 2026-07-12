@@ -315,10 +315,12 @@ aw_per_foot, paw_total, ad_limit = calculate_irrigation_limits(soil_choice, dept
 
 # 2. Grab the raw constants for the audit display (converted to inches/foot)
 soil_info = SOIL_DATA.get(soil_choice, SOIL_DATA["Loam"])
-fc_inft = soil_info["FC"] * 12
-pwp_inft = soil_info["PWP"] * 12
+fc_raw = soil_info["FC"]
+pwp_raw = soil_info["PWP"]
+fc_inft = fc_raw * 12
+pwp_inft = pwp_raw * 12
 rz_ft = depth_in / 12
-
+aw_capacity_inft = (fc_raw - pwp_raw) * 12
 
 
 
@@ -452,28 +454,17 @@ if df_api is not None:
     # 7.1 Determine this zone's specific starting point
     zone_start_str = current_zone.get("start_date", str(datetime.now().date()))
     zone_start_ts = pd.Timestamp(zone_start_str).normalize()
-    today_ts = pd.Timestamp(datetime.now().date()).normalize()
-
-    # 7.2 Filter weather data to ONLY include days since this zone started
-    # We include today (<= today_dt) to fix the "missing today" issue
     mask = (df_daily['time'] >= zone_start_ts) & (df_daily['time'] <= today_dt)
-    zone_weather = df_daily.loc[mask]
+    zone_weather = df_daily.loc[mask].sort_values('time')
     
-    # 7.3 Sum losses and gains for this specific window
-    total_et = zone_weather['ET0 (in)'].sum()
-    total_rain = zone_weather['Rain (in)'].sum()
-    total_irrigation = zone_weather['Irrigation (in)'].sum()
-    
-    total_gains = total_rain + total_irrigation
-    
-    # 7.4 The Resulting Deficit
-    current_deficit = total_et - total_gains
-    
-    # Safety: Soil can't be more than "Full" (Deficit 0)
-    if current_deficit < 0:
-        current_deficit = 0.0
-
-    # 7.5 Actionable Metrics
+    running_deficit = 0.0
+    for idx, row in zone_weather.iterrows():
+        running_deficit += row['ET0 (in)']
+        running_deficit -= (row['Rain (in)'] + row['Irrigation (in)'])
+        if running_deficit < 0:
+            running_deficit = 0.0
+            
+    current_deficit = running_deficit
     gallons = current_deficit * area * 0.623
     runtime = gallons / flow if flow > 0 else 0
         
@@ -484,38 +475,31 @@ if df_api is not None:
 #### 8. Dashboard Metrics
     st.markdown(f"### {active_prop} : {active_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
     st.divider()
-    seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum()
-    seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum()
-    today_et = df_forecast.iloc[0]['ET0 (in)']
-    today_rain = df_forecast.iloc[0]['Rain (in)']
-    m1, m2, m3, m4 = st.columns(4)
+    seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum() if len(df_forecast) >= 7 else df_forecast['ET0 (in)'].sum()
+    seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum() if len(df_forecast) >= 7 else df_forecast['Rain (in)'].sum()
+    today_et = df_forecast.iloc[0]['ET0 (in)'] if not df_forecast.empty else 0.0
+    today_rain = df_forecast.iloc[0]['Rain (in)'] if not df_forecast.empty else 0.0
     
-    # Metric 3 is now 7-Day ET
-    m3.metric("7-Day ET Forecast", f"{seven_day_et:.2f}\"", delta=f"Today: {today_et:.2f}\"", delta_color="inverse")
-    
-    # Metric 4 7-Day Rain
-    m4.metric("7-Day Rain Forecast", f"{seven_day_rain:.2f}\"", delta=f"Today: {today_rain:.2f}\"")
-    
-    # Metric 1 is now the Water to Apply (Depth, Time, and Vol)
-    m1.metric("Water to Apply", f"{ current_deficit:.2f}\"", 
-              delta=f"{runtime:.1f} min ({gallons:.0f} gal)")
-     
-    # Metric 2: Allowable Depletion & Status Arrow [Logic: If deficit is less than AD, we are "OK" (Green). If deficit > AD, we are "Over" (Red).]
     if current_deficit < ad_limit:
         status_msg = "✋ Wait to Water"
-        d_val = "OK"
-        d_color = "normal"  # Shows Green arrow pointing up/stable status
     else:
         status_msg = "💧 Time to Water!"
-        d_val = "LOW"
-        d_color = "inverse" # Shows Red
-
-    m2.metric(
-        label="Allowable Depletion", 
-        value=f"{ad_limit:.2f}\"", 
-        delta=status_msg, 
-        delta_color=d_color
-    )
+        
+    m1, m2, m3, m4 = st.columns(4)
+    
+    # 1. Water to Apply (Removed delta argument entirely)
+    m1.metric("Water to Apply", f"{current_deficit:.2f}\"")
+    st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
+    st.divider()
+    
+    # 2. Allowable Depletion (Removed delta and delta_color)
+    m2.metric(label="Allowable Depletion", value=f"{ad_limit:.2f}\"")
+    
+    # 3. 7-Day ET Forecast (Removed delta and delta_color)
+    m3.metric("7-Day ET Forecast", f"{seven_day_et:.2f}\"")
+    
+    # 4. 7-Day Rain Forecast (Removed delta)
+    m4.metric("7-Day Rain Forecast", f"{seven_day_rain:.2f}\"")
   
     # Guidance Logic based on Forecast
     if seven_day_rain >  current_deficit and  current_deficit > 0:
@@ -818,9 +802,96 @@ with tab_refs:
     
 #### 99. Backup Utility
 import shutil
+import subprocess  # Added to trigger Windows File Explorer when running locally
+import platform
 
 st.divider()
 with st.expander("🛡️ Data Security & Backups"):
+    st.write("### 📂 Active Database Storage Paths")
+    
+    soil_info = SOIL_DATA.get(soil_choice, SOIL_DATA["Loam"])
+    fc_raw = soil_info["FC"]    
+    pwp_raw = soil_info["PWP"]
+    
+    try:
+        # 1. Direct variable matching using fallback try/except blocks
+        try:
+            profiles_path = os.path.abspath(DATA_FILE)
+        except NameError:
+            try:
+                profiles_path = os.path.abspath(DATA_FILE_PATH)
+            except NameError:
+                try:
+                    profiles_path = os.path.abspath(PROFILES_FILE)
+                except NameError:
+                    if 'DATA_DIR' in locals() or 'DATA_DIR' in globals():
+                        profiles_path = os.path.join(os.path.abspath(DATA_DIR), "profiles.json")
+                    else:
+                        profiles_path = "Not Configured"
+
+        logs_path = os.path.abspath(LOG_FILE) if 'LOG_FILE' in globals() or 'LOG_FILE' in locals() else "Not Configured"
+        weather_path = os.path.abspath(WEATHER_LOG) if 'WEATHER_LOG' in globals() or 'WEATHER_LOG' in locals() else "Not Configured"
+        
+        # Display the paths cleanly
+        st.code(f"""
+Zone Profiles Directory: {os.path.dirname(profiles_path) if profiles_path != 'Not Configured' else 'Unknown'}
+↳ Active File: {os.path.basename(profiles_path)}
+
+Watering Logs Directory: {os.path.dirname(logs_path) if logs_path != 'Not Configured' else 'Unknown'}
+↳ Active File: {os.path.basename(logs_path)}
+
+Weather Cache Directory: {os.path.dirname(weather_path) if weather_path != 'Not Configured' else 'Unknown'}
+↳ Active File: {os.path.basename(weather_path)}
+        """, language="text")
+
+        # --- LOCAL DIRECTORY SHORTCUT BUTTON ---
+        target_dir = os.path.dirname(logs_path) if logs_path != 'Not Configured' else None
+        
+        if target_dir and os.path.exists(target_dir):
+            # Check if we are running locally (Windows) vs Streamlit Cloud (Linux)
+            is_local = platform.system() == "Windows"
+            
+            if is_local:
+                if st.button("📂 Open Data Folder in Windows Explorer", use_container_width=True):
+                    try:
+                        # This command pops open the actual local Windows folder instantly!
+                        subprocess.run(['explorer', os.path.normpath(target_dir)])
+                        st.success("Folder opened!")
+                    except Exception as explorer_err:
+                        st.error(f"Could not open explorer: {explorer_err}")
+            else:
+                st.info("💡 Cloud Environment: Folder is stored inside the secure Streamlit server container.")
+
+    except Exception as e:
+        st.info("System paths are dynamic on cloud containers.")
+
+    st.write("### 📥 Download App Data")
+    st.caption("Save your configurations and watering ledgers directly to your device.")
+    
+    profiles_string = json.dumps(profiles, indent=4)
+    all_logs = load_logs()
+    logs_string = json.dumps(all_logs, indent=4)
+    
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            label="📥 Download Zone Profiles (.json)",
+            data=profiles_string,
+            file_name=f"{active_prop}_profiles.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    with dl_col2:
+        st.download_button(
+            label="📥 Download Watering Logs (.json)",
+            data=logs_string,
+            file_name=f"{active_prop}_history_log.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+    st.divider()
+    st.write("### 🚀 Server System Backups")
     st.write("Click below to create a timestamped clone of all properties, zones, and history.")
     
     if st.button("🚀 Create Instant Backup"):
@@ -843,3 +914,14 @@ with st.expander("🛡️ Data Security & Backups"):
             st.error(f"Backup failed: {e}")
 
     st.caption("Note: This creates a local copy on your machine. For extra safety, copy the 'Backups' folder to a cloud drive.")
+
+
+st.divider()
+st.markdown(
+    """
+    <div style='text-align: center; color: gray; font-size: 0.8em;'>
+        Irrigation Dashboard • v3.21
+    </div>
+    """, 
+    unsafe_allow_html=True
+)

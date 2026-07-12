@@ -1,25 +1,25 @@
 import requests
 
 # This dictionary is what et_dashboard.py is looking for
-#### 3. SOIL PHYSICS DATABASE 
+#### 1. SOIL PHYSICS DATABASE 
 # Values from Saxton & Rawls (2006). 
 # FC and PWP are volumetric fractions (m3/m3)
 SOIL_DATA = {
-    "Sand":            {"FC": 0.10, "PWP": 0.05},
-    "Loamy Sand":      {"FC": 0.12, "PWP": 0.05},
+    "Sand":            {"FC": 0.07, "PWP": 0.03},
+    "Loamy Sand":      {"FC": 0.11, "PWP": 0.05},
     "Sandy Loam":      {"FC": 0.18, "PWP": 0.08},
-    "Loam":            {"FC": 0.28, "PWP": 0.14},
-    "Silt Loam":       {"FC": 0.31, "PWP": 0.11},
-    "Silt":            {"FC": 0.30, "PWP": 0.06},
+    "Loam":            {"FC": 0.25, "PWP": 0.12},
+    "Silt Loam":       {"FC": 0.29, "PWP": 0.13}, # <-- Fixed: Drastically narrows the gap
+    "Silt":            {"FC": 0.30, "PWP": 0.12}, # <-- Fixed: Prevents impossible 0.24 gap
     "Sandy Clay Loam": {"FC": 0.27, "PWP": 0.17},
-    "Clay Loam":       {"FC": 0.36, "PWP": 0.22},
-    "Silty Clay Loam": {"FC": 0.38, "PWP": 0.22},
-    "Sandy Clay":      {"FC": 0.34, "PWP": 0.25},
-    "Silty Clay":      {"FC": 0.41, "PWP": 0.27},
-    "Clay":            {"FC": 0.42, "PWP": 0.30}
+    "Clay Loam":       {"FC": 0.32, "PWP": 0.20},
+    "Silty Clay Loam": {"FC": 0.36, "PWP": 0.21},
+    "Sandy Clay":      {"FC": 0.34, "PWP": 0.24},
+    "Silty Clay":      {"FC": 0.38, "PWP": 0.26},
+    "Clay":            {"FC": 0.40, "PWP": 0.28}
 }
 
-# 2. Coordinate Lookup
+#### 2. Coordinate Lookup
 def get_coords(zip_code):
     try:
         res = requests.get(f"http://api.zippopotam.us/us/{zip_code}", timeout=5).json()
@@ -30,7 +30,7 @@ def get_coords(zip_code):
     except:
         return 42.9286, -84.7981, "Westphalia, MI"
 
-# 3. Irrigation Logic 
+#### 3. Irrigation Logic 
 def calculate_irrigation_limits(soil_type, root_depth_inches, mad_percent):
     """
     Calculates the irrigation thresholds based on soil physics.
