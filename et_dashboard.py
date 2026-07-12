@@ -846,52 +846,7 @@ import platform
 
 st.divider()
 with st.expander("🛡️ Data Security & Backups"):
-    st.write("### 📂 Active Database Storage Paths")
     
-    soil_info = SOIL_DATA.get(soil_choice, SOIL_DATA["Loam"])
-    fc_raw = soil_info["FC"]    
-    pwp_raw = soil_info["PWP"]
-    
-    try:
-        # 1. Direct variable matching using fallback try/except blocks
-        try:
-            profiles_path = os.path.abspath(DATA_FILE)
-        except NameError:
-            try:
-                profiles_path = os.path.abspath(DATA_FILE_PATH)
-            except NameError:
-                try:
-                    profiles_path = os.path.abspath(PROFILES_FILE)
-                except NameError:
-                    if 'DATA_DIR' in locals() or 'DATA_DIR' in globals():
-                        profiles_path = os.path.join(os.path.abspath(DATA_DIR), "profiles.json")
-                    else:
-                        profiles_path = "Not Configured"
-
-        logs_path = os.path.abspath(LOG_FILE) if 'LOG_FILE' in globals() or 'LOG_FILE' in locals() else "Not Configured"
-        weather_path = os.path.abspath(WEATHER_LOG) if 'WEATHER_LOG' in globals() or 'WEATHER_LOG' in locals() else "Not Configured"
-        
-
-        # --- LOCAL DIRECTORY SHORTCUT BUTTON ---
-        target_dir = os.path.dirname(logs_path) if logs_path != 'Not Configured' else None
-        
-        if target_dir and os.path.exists(target_dir):
-            # Check if we are running locally (Windows) vs Streamlit Cloud (Linux)
-            is_local = platform.system() == "Windows"
-            
-            if is_local:
-                if st.button("📂 Open Data Folder in Windows Explorer", use_container_width=True):
-                    try:
-                        # This command pops open the actual local Windows folder instantly!
-                        subprocess.run(['explorer', os.path.normpath(target_dir)])
-                        st.success("Folder opened!")
-                    except Exception as explorer_err:
-                        st.error(f"Could not open explorer: {explorer_err}")
-            else:
-                st.info("💡 Cloud Environment: Folder is stored inside the secure Streamlit server container.")
-
-    except Exception as e:
-        st.info("System paths are dynamic on cloud containers.")
 
     st.write("### 📥 Download App Data")
     st.caption("Save your configurations and watering ledgers directly to your device.")
@@ -903,7 +858,7 @@ with st.expander("🛡️ Data Security & Backups"):
     dl_col1, dl_col2 = st.columns(2)
     with dl_col1:
         st.download_button(
-            label="📥 Download Zone Profiles (.json)",
+            label="📥 Download Zone Profiles",
             data=profiles_string,
             file_name=f"{active_prop}_profiles.json",
             mime="application/json",
@@ -911,7 +866,7 @@ with st.expander("🛡️ Data Security & Backups"):
         )
     with dl_col2:
         st.download_button(
-            label="📥 Download Watering Logs (.json)",
+            label="📥 Download Watering Logs",
             data=logs_string,
             file_name=f"{active_prop}_history_log.json",
             mime="application/json",
