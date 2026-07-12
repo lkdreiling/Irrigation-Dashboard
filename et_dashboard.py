@@ -84,24 +84,93 @@ with head_col2:
             st.rerun()
         
         st.divider()
-        st.subheader("Danger Zone")
-        if st.button(f"💥 Wipe {active_prop} Zones", type="primary"):
-            for suffix in ["_profiles.json", "_log.json"]:
-                path = os.path.join(DATA_DIR, f"{active_prop}{suffix}")
-                if os.path.exists(path): 
-                    os.remove(path)
-            st.warning(f"Zones for {active_prop} deleted.")
+        if st.button(f"💥 Delete {active_prop} Zones", type="primary"):
+            # Wipe all data rows matching this specific property name from the server instantly
+            with conn.session as session:
+                session.execute("DELETE FROM zone_profiles WHERE property = :prop", {"prop": active_prop})
+                session.execute("DELETE FROM watering_logs WHERE property = :prop", {"prop": active_prop})
+                session.commit()
+            
+            st.cache_data.clear()
+            st.warning(f"All database rows for {active_prop} completely wiped.")
             st.rerun()
                              
 
 
 # --- FILE PATHS ---
 # Zones and Logs stay in main folder for easy access
-DB_FILE = os.path.join(DATA_DIR, f"{active_prop}_profiles.json")
-LOG_FILE = os.path.join(DATA_DIR, f"{active_prop}_log.json")
+# --- CLOUD DATABASE FUNCTIONS (No local files needed) ---
 
-# WEATHER moves to the "Do Not Delete" folder
-WEATHER_LOG = os.path.join(SYSTEM_DIR, f"{active_prop}_weather.json")
+def load_profiles():
+    # Fetch all zone settings from the offsite database for the active property
+    query = "SELECT zone_name, area, flow, soil, depth, mad FROM zone_profiles WHERE property = :prop"
+    df = conn.query(query, params={"prop": active_prop}, ttl=0)
+    
+    if df.empty:
+        # Pre-make the 12 default zones on the cloud if it's a brand new property profile
+        default_twelve_zones = {}
+        for i in range(1, 13):
+            default_twelve_zones[f"Zone {i}"] = {
+                "area": 2000, "flow": 20, "soil": "Loam", "depth": 12, "mad": 50
+            }
+        return default_twelve_zones
+        
+    # Convert database rows smoothly back into your standard dictionary format
+    return df.set_index("zone_name").to_dict(orient="index")
+
+
+def save_profiles(p):
+    # Upsert (Insert or update if already existing) the active zone data rows on the server
+    with conn.session as session:
+        for zone_name, specs in p.items():
+            session.execute(
+                """
+                INSERT INTO zone_profiles (property, zone_name, area, flow, soil, depth, mad)
+                VALUES (:prop, :zone, :area, :flow, :soil, :depth, :mad)
+                ON CONFLICT (property, zone_name) 
+                DO UPDATE SET area = EXCLUDED.area, flow = EXCLUDED.flow, soil = EXCLUDED.soil, depth = EXCLUDED.depth, mad = EXCLUDED.mad;
+                """,
+                {
+                    "prop": active_prop, "zone": zone_name, 
+                    "area": int(specs["area"]), "flow": int(specs["flow"]), 
+                    "soil": specs["soil"], "depth": int(specs["depth"]), "mad": int(specs["mad"])
+                }
+            )
+        session.commit()
+    # Force Streamlit to instantly request the updated rows on reload
+    st.cache_data.clear()
+
+
+def load_logs():
+    # Pull water history matching this property
+    query = "SELECT zone_name, log_date, minutes, inches FROM watering_logs WHERE property = :prop"
+    df = conn.query(query, params={"prop": active_prop}, ttl=0)
+    
+    logs = {}
+    if not df.empty:
+        for _, row in df.iterrows():
+            z = row['zone_name']
+            if z not in logs: logs[z] = []
+            logs[z].append({"date": str(row['log_date']), "minutes": row['minutes'], "inches": row['inches']})
+    return logs
+
+
+def save_log(zone, minutes, inches_applied):
+    # Log a fresh irrigation event straight to the cloud tables
+    with conn.session as session:
+        session.execute(
+            """
+            INSERT INTO watering_logs (property, zone_name, log_date, minutes, inches)
+            VALUES (:prop, :zone, :log_date, :mins, :inch);
+            """,
+            {
+                "prop": active_prop, "zone": zone, 
+                "log_date": str(datetime.now().date()), 
+                "mins": float(minutes), "inch": float(inches_applied)
+            }
+        )
+        session.commit()
+    st.cache_data.clear()
 
 def load_profiles():
     if os.path.exists(DB_FILE):
@@ -832,17 +901,6 @@ with st.expander("🛡️ Data Security & Backups"):
         logs_path = os.path.abspath(LOG_FILE) if 'LOG_FILE' in globals() or 'LOG_FILE' in locals() else "Not Configured"
         weather_path = os.path.abspath(WEATHER_LOG) if 'WEATHER_LOG' in globals() or 'WEATHER_LOG' in locals() else "Not Configured"
         
-        # Display the paths cleanly
-        st.code(f"""
-Zone Profiles Directory: {os.path.dirname(profiles_path) if profiles_path != 'Not Configured' else 'Unknown'}
-↳ Active File: {os.path.basename(profiles_path)}
-
-Watering Logs Directory: {os.path.dirname(logs_path) if logs_path != 'Not Configured' else 'Unknown'}
-↳ Active File: {os.path.basename(logs_path)}
-
-Weather Cache Directory: {os.path.dirname(weather_path) if weather_path != 'Not Configured' else 'Unknown'}
-↳ Active File: {os.path.basename(weather_path)}
-        """, language="text")
 
         # --- LOCAL DIRECTORY SHORTCUT BUTTON ---
         target_dir = os.path.dirname(logs_path) if logs_path != 'Not Configured' else None
@@ -920,7 +978,7 @@ st.divider()
 st.markdown(
     """
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • v3.21
+        Irrigation Dashboard • v0.33
     </div>
     """, 
     unsafe_allow_html=True
