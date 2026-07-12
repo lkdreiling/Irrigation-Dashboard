@@ -140,6 +140,9 @@ def save_log(zone, minutes, inches_applied):
 
 def archive_weather(df_daily):
     history = {}
+    if not os.path.exists(WEATHER_LOG):
+        with open(WEATHER_LOG, "w") as f:
+            json.dump({}, f)
     if os.path.exists(WEATHER_LOG):
         with open(WEATHER_LOG, "r") as f: history = json.load(f)
     for _, row in df_daily.iterrows():
