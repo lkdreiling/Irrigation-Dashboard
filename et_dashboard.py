@@ -29,6 +29,13 @@ st.markdown("""
             padding-bottom: 0rem;
             margin-top: 0rem;
         }
+        /* Mobile responsive adjustments for Metric blocks */
+        [data-testid="stMetricValue"] {
+            font-size: 1.8rem !important;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.9rem !important;
+        }
     </style>
 """, unsafe_allow_html=True)
 st.title("🌱 Irrigation Dashboard")
@@ -162,7 +169,7 @@ profiles = load_profiles()
 
 
 
-#### 4. ZONE SELECTION & MANAGEMENT
+#### 4. Sidebar 
 st.sidebar.header(f"📍 {active_prop} Zones")
 
 # 1. Extract the current zones from profiles
@@ -302,6 +309,10 @@ if st.sidebar.button("Add to History"):
     save_log(active_zone_name, run_mins, applied_inches)
     st.sidebar.success(f"Logged {applied_inches:.2f}\" applied!")
     st.rerun()
+    
+# Place a clean, low-profile version tag at the baseline of the sidebar panel
+st.sidebar.caption("—" * 15)
+st.sidebar.caption("🤖 System Version: `v1.2.0` | Environment: Local")   
 
 
 
@@ -819,7 +830,34 @@ import shutil
 st.divider()
 with st.expander("🛡️ Data Security & Backups"):
     st.write("Click below to create a timestamped clone of all properties, zones, and history.")
+    st.caption("Save your configurations and watering ledgers directly to your device.")
+
+    profiles_string = json.dumps(profiles, indent=4)
+    all_logs = load_logs()
+    logs_string = json.dumps(all_logs, indent=4)
     
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            label="📥 Download Zone Profiles (.json)",
+            data=profiles_string,
+            file_name=f"{active_prop}_profiles.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    with dl_col2:
+        st.download_button(
+            label="📥 Download Watering Logs (.json)",
+            data=logs_string,
+            file_name=f"{active_prop}_history_log.json",
+            mime="application/json",
+            use_container_width=True
+        )
+        
+    st.divider()
+    st.write("### 🚀 Server System Backups")
+    # ... Leave your original "Create Instant Backup" button code down here ...
+
     if st.button("🚀 Create Instant Backup"):
         # Create a unique folder name: e.g., "Backup_2024-05-20_14-30"
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
