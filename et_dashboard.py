@@ -22,6 +22,7 @@ from core_logic import SOIL_DATA, get_coords, calculate_irrigation_limits
 
 #### 1.1 Page Configuration
 st.set_page_config(page_title="Irrigation Dashboard", layout="wide", page_icon="🌱")
+conn = st.connection("postgresql", type="sql")
 st.markdown("""
     <style>
         .block-container {
@@ -97,8 +98,10 @@ with head_col2:
                              
 
 
-# --- FILE PATHS ---
-# Zones and Logs stay in main folder for easy access
+## --- FILE PATHS & CLOUD DATABASE CONFIG ---
+# WEATHER moves to the "Do Not Delete" folder
+WEATHER_LOG = os.path.join(SYSTEM_DIR, f"{active_prop}_weather.json")
+
 # --- CLOUD DATABASE FUNCTIONS (No local files needed) ---
 
 def load_profiles():
@@ -172,40 +175,6 @@ def save_log(zone, minutes, inches_applied):
         session.commit()
     st.cache_data.clear()
 
-def load_profiles():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r") as f: return json.load(f)
-        except: pass
-    # --- PRE-MAKE 12 DEFAULT ZONES ---
-    # Generates a standard baseline layout so managers don't have to build it manually
-    default_twelve_zones = {}
-    for i in range(1, 13):
-        default_twelve_zones[f"Zone {i}"] = {
-            "zip": active_zip, 
-            "area": 2000,   # Now a clean whole number
-            "flow": 20,      # Now a clean whole number
-            "soil": "Loam", 
-            "depth": 12, 
-            "mad": 50
-        }   
-    return default_twelve_zones
-
-def save_profiles(p):
-    with open(DB_FILE, "w") as f: json.dump(p, f)
-
-def load_logs():
-    if os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, "r") as f: return json.load(f)
-        except: pass
-    return {}
-
-def save_log(zone, minutes, inches_applied):
-    logs = load_logs()
-    if zone not in logs: logs[zone] = []
-    logs[zone].append({"date": str(datetime.now().date()), "minutes": minutes, "inches": inches_applied})
-    with open(LOG_FILE, "w") as f: json.dump(logs, f)
 
 def archive_weather(df_daily):
     history = {}
@@ -220,6 +189,7 @@ def archive_weather(df_daily):
             history[date_str] = {"ET0 (in)": row["ET0 (in)"], "Rain (in)": row["Rain (in)"]}
     with open(WEATHER_LOG, "w") as f: json.dump(history, f)
 
+
 def load_weather_history():
     if os.path.exists(WEATHER_LOG):
         with open(WEATHER_LOG, "r") as f:
@@ -230,9 +200,9 @@ def load_weather_history():
             return df
     return pd.DataFrame(columns=['time', 'ET0 (in)', 'Rain (in)'])
 
+
+# --- INITIAL DATA INITIALIZATION RUN ---
 profiles = load_profiles()
-
-
 
 #### 4. ZONE SELECTION & MANAGEMENT
 st.sidebar.header(f"📍 {active_prop} Zones")
