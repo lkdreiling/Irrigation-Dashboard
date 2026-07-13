@@ -10,6 +10,7 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 from datetime import timedelta
+from sqlalchemy import text
 
 
 #### 1.0 IMPORT YOUR CUSTOM MODULES  
@@ -88,8 +89,14 @@ with head_col2:
         if st.button(f"💥 Delete {active_prop} Zones", type="primary"):
             # Wipe all data rows matching this specific property name from the server instantly
             with conn.session as session:
-                session.execute("DELETE FROM zone_profiles WHERE property = :prop", {"prop": active_prop})
-                session.execute("DELETE FROM watering_logs WHERE property = :prop", {"prop": active_prop})
+                session.execute(
+                    text("DELETE FROM zone_profiles WHERE property = :prop"), 
+                    {"prop": active_prop}
+                )
+                session.execute(
+                    text("DELETE FROM watering_logs WHERE property = :prop"), 
+                    {"prop": active_prop}
+                )
                 session.commit()
             
             st.cache_data.clear()
@@ -121,18 +128,18 @@ def load_profiles():
     # Convert database rows smoothly back into your standard dictionary format
     return df.set_index("zone_name").to_dict(orient="index")
 
-
+from sqlalchemy import text  # Ensure text is imported to format the raw query safely
 def save_profiles(p):
     # Upsert (Insert or update if already existing) the active zone data rows on the server
     with conn.session as session:
         for zone_name, specs in p.items():
             session.execute(
-                """
+                text("""
                 INSERT INTO zone_profiles (property, zone_name, area, flow, soil, depth, mad)
                 VALUES (:prop, :zone, :area, :flow, :soil, :depth, :mad)
                 ON CONFLICT (property, zone_name) 
                 DO UPDATE SET area = EXCLUDED.area, flow = EXCLUDED.flow, soil = EXCLUDED.soil, depth = EXCLUDED.depth, mad = EXCLUDED.mad;
-                """,
+                """),
                 {
                     "prop": active_prop, "zone": zone_name, 
                     "area": int(specs["area"]), "flow": int(specs["flow"]), 
@@ -161,15 +168,19 @@ def load_logs():
 def save_log(zone, minutes, inches_applied):
     # Log a fresh irrigation event straight to the cloud tables
     with conn.session as session:
-        session.execute(
-            """
+        query = text("""
             INSERT INTO watering_logs (property, zone_name, log_date, minutes, inches)
-            VALUES (:prop, :zone, :log_date, :mins, :inch);
-            """,
+            VALUES (:prop, :zone, :date, :mins, :inches);
+        """)
+        
+        session.execute(
+            query,
             {
-                "prop": active_prop, "zone": zone, 
-                "log_date": str(datetime.now().date()), 
-                "mins": float(minutes), "inch": float(inches_applied)
+                "prop": active_prop,
+                "zone": zone,
+                "date": datetime.now().date(),
+                "mins": float(minutes),
+                "inches": float(inches_applied)
             }
         )
         session.commit()
@@ -210,57 +221,117 @@ st.sidebar.header(f"📍 {active_prop} Zones")
 # 1. Extract the current zones from profiles
 zone_list = list(profiles.keys())
 
+if not zone_list:
+    st.sidebar.warning("No zones found for this property.")
+    if st.sidebar.button("➕ Initialize Default Zone 1", use_container_width=True):
+        profiles["Zone 1"] = {
+            "zip": active_zip,
+            "area": 1000,
+            "flow": 5,
+            "soil": "Loam",
+            "depth": 6,
+            "mad": 50
+        }
+        save_profiles(profiles)
+        st.rerun()
+    st.stop()
+
+# Define Callbacks for "Hit Enter to Save" automation
+def handle_rename_submit():
+    new_name = st.session_state.rename_input.strip()
+    if new_name and new_name != active_zone_name:
+        profiles[new_name] = profiles.pop(active_zone_name)
+        
+        # Sync the local historical logs with the new name change
+        logs = load_logs()
+        if active_zone_name in logs:
+            logs[new_name] = logs.pop(active_zone_name)
+            with open(LOG_FILE, "w") as f: 
+                json.dump(logs, f)
+        
+        save_profiles(profiles)
+        st.toast(f"✏️ Renamed to {new_name}!")
+        st.rerun()
+
+def handle_add_submit():
+    custom_new_zone = st.session_state.add_input.strip()
+    if custom_new_zone and custom_new_zone not in profiles:
+        profiles[custom_new_zone] = {
+            "zip": active_zip,
+            "area": 1000,
+            "flow": 5,
+            "soil": "Loam",
+            "depth": 12,
+            "mad": 50
+        }
+        save_profiles(profiles)
+        st.toast(f"🌱 {custom_new_zone} added successfully!")
+        st.rerun()
+
 # Create layout inside the sidebar for the selection widget and option settings
-# This keeps everything neatly grouped together on the left panel
 zone_col1, zone_col2 = st.sidebar.columns([3, 1]) 
 
 with zone_col1:
-    # Main Dropdown Menu - now locked inside the sidebar
+    # Main Dropdown Menu: Dynamically scales based on the current size of zone_list
     active_zone_name = st.selectbox("Select Active Zone", zone_list, label_visibility="visible")
     current_zone = profiles[active_zone_name]
 
 with zone_col2:
-    # Add spacing to align vertically with the sidebar selectbox label
     st.write(" ")
     st.write(" ")
     with st.popover("⚙️"):
+        # SECTION A: RENAME ZONE (Hit Enter to Save)
         st.subheader("📝 Rename This Zone")
-        new_zone_name_input = st.text_input("New Name", value=active_zone_name, key="rename_input")
+        st.text_input(
+            "New Name", 
+            value=active_zone_name, 
+            key="rename_input",
+            on_change=handle_rename_submit
+        )
         
-        if st.button("Save Name", use_container_width=True):
-            if new_zone_name_input and new_zone_name_input != active_zone_name:
-                profiles[new_zone_name_input] = profiles.pop(active_zone_name)
-                
-                logs = load_logs()
-                if active_zone_name in logs:
-                    logs[new_zone_name_input] = logs.pop(active_zone_name)
-                    with open(LOG_FILE, "w") as f: 
-                        json.dump(logs, f)
-                
-                save_profiles(profiles)
-                st.success(f"Renamed to {new_zone_name_input}!")
-                st.rerun()
+        st.divider()
+        
+        # SECTION B: ADD EXTRA ZONE (Hit Enter to Save)
+        st.subheader("➕ Add Extra Zone")
+        st.text_input(
+            "Zone Name", 
+            key="add_input",
+            on_change=handle_add_submit
+        )
+        if st.session_state.add_input.strip() in profiles and st.session_state.add_input.strip() != "":
+            st.error("A zone with that name already exists.")
 
         st.divider()
-        st.subheader("➕ Add Extra Zone")
-        custom_new_zone = st.text_input("Zone Name (e.g., Zone 13)", key="add_input")
         
-        if st.button("Create Zone", use_container_width=True, type="primary"):
-            if custom_new_zone and custom_new_zone not in profiles:
-                profiles[custom_new_zone] = {
-                    "zip": active_zip,
-                    "area": 1000,
-                    "flow": 5,
-                    "soil": "Loam",
-                    "depth": 12,
-                    "mad": 50
-                }
+        # SECTION C: REMOVE ACTIVE ZONE (Moved inside settings menu)
+        st.subheader("🗑️ Remove This Zone")
+        st.markdown(f"Wipe profile configuration and structural metrics for **{active_zone_name}**.")
+        if st.button(f"Delete {active_zone_name}", type="primary", use_container_width=True):
+            with conn.session as session:
+                session.execute(
+                    text("DELETE FROM zone_profiles WHERE property = :prop AND zone_name = :zone"),
+                    {"prop": active_prop, "zone": active_zone_name}
+                )
+                session.execute(
+                    text("DELETE FROM watering_logs WHERE property = :prop AND zone_name = :zone"),
+                    {"prop": active_prop, "zone": active_zone_name}
+                )
+                session.commit()
+                
+            if active_zone_name in profiles:
+                profiles.pop(active_zone_name)
                 save_profiles(profiles)
-                st.success(f"{custom_new_zone} added!")
-                st.rerun()
-            elif custom_new_zone in profiles:
-                st.error("A zone with that name already exists.")
-  
+            
+            logs = load_logs()
+            if active_zone_name in logs:
+                logs.pop(active_zone_name)
+                with open(LOG_FILE, "w") as f:
+                    json.dump(logs, f)
+            
+            save_profiles(profiles)
+            st.cache_data.clear()
+            st.toast(f"💥 Wiped {active_zone_name} from dashboard configuration profile.")
+            st.rerun()
 
 @st.cache_data(ttl=3600)
 def get_coords(zip_code):
@@ -295,8 +366,25 @@ except ValueError:
     soil_index = soil_types.index("Loam")
 soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
 
-depth_in = st.sidebar.slider("Root Depth (in)", 4, 36, current_depth)
-mad = st.sidebar.slider("MAD (%)", 10, 60, current_mad)
+depth_in = st.sidebar.slider(
+    "Root Depth (in)", 
+    min_value=1,   
+    max_value=24,  
+    value=6, 
+    help="The target active root depth profile. Deeper roots have access to a larger structural water reservoir, requiring less frequent but longer watering cycles."
+)
+mad = st.sidebar.slider(
+    "Manageable Allowable Depletion (MAD %)",
+    min_value=10,
+    max_value=80,
+    value=50,
+    step=5,
+    help="""Manageable Allowable Depletion. The percentage of the soil's water storage capacity allowed to dry out before triggering the next irrigation cycle."
+    * **Lower % (e.g., 30-40%):** Kept wetter. Best for sensitive, shallow-rooted plants or high-stress periods.
+    * **Standard (50%):** The industry baseline. Maximizes root health and water efficiency without stressing the crop.
+    * **Higher % (e.g., 60-70%):** Kept drier. Used for drought-tolerant species or to encourage deep root growth.
+"""
+)
 
 # 3. AUTO-SAVE CHECK: Compare current inputs against what is saved in the file
 if (area != current_area or 
@@ -323,27 +411,53 @@ if (area != current_area or
     save_profiles(profiles)
     st.rerun() # Refresh layout instantly to update downstream ET calculations
 
-# 4. CLEAN DELETE INTERFACE
-# Since save is gone, delete just needs a full column width to sit cleanly
-if st.sidebar.button("🗑️ Delete This Zone", use_container_width=True, type="secondary"):
-    if len(profiles) > 1:
-        del profiles[active_zone_name]
-        save_profiles(profiles)
-        st.rerun()
-    else: 
-        st.error("Cannot delete last zone.")
     
 st.sidebar.divider()
 
 # --- WATER LOGGING MANAGEMENT ---
 st.sidebar.header("📝 Log a Watering Event")
-run_mins = st.sidebar.number_input("Actual Runtime (min)", min_value=0.0, step=1.0)
 
-if st.sidebar.button("Add to History"):
-    applied_inches = (run_mins * flow) / (area * 0.623)
-    save_log(active_zone_name, run_mins, applied_inches)
-    st.sidebar.success(f"Logged {applied_inches:.2f}\" applied!")
-    st.rerun()
+def handle_quick_submit():
+    # Only execute if the user actually ran the system for more than 0 minutes
+    if st.session_state.quick_mins > 0:
+        # 1. Grab the active zone configuration numbers from the current dashboard state
+        # (Make sure these match the exact variable names used in your Section 8 calculation)
+        try:
+            flow_val = float(active_flow)
+            area_val = float(active_area)
+        except (NameError, TypeError, ValueError):
+            # Fallback values if variables aren't globally accessible inside the sidebar function
+            flow_val = 10.0
+            area_val = 500.0
+
+        # 2. Calculate the real-time Precipitation Rate using the standard formula
+        if area_val > 0:
+            rate = (flow_val * 96.25) / area_val
+        else:
+            rate = 0.5  # Engineering default fallback if area is 0
+        
+        # 3. Compute precisely how much depth was applied 
+        calc_inches = (st.session_state.quick_mins / 60.0) * rate
+        
+        # 4. Save to Supabase instantly using your schema-corrected function
+        save_log(active_zone_name, st.session_state.quick_mins, calc_inches)
+        
+        # 5. Notify user with a toast popup banner
+        st.toast(f"🌱 Logged {st.session_state.quick_mins} mins to {active_zone_name} history!")
+        
+        # Reset the input box back to 0 so it doesn't double-trigger on the next click
+        st.session_state.quick_mins = 0.0
+
+# Ensure your soil selectbox has a key="soil_type" matching the state lookup above!
+st.sidebar.number_input(
+    label="⏱️ Enter Runtime Minutes & Hit Enter:",
+    min_value=0.0,
+    max_value=240.0,
+    value=0.0,
+    step=1.0,
+    key="quick_mins",              # Ties the value directly to session memory
+    on_change=handle_quick_submit  # Executes the save function the moment they press Enter
+)
 
 
 
@@ -526,19 +640,36 @@ if df_api is not None:
         
     m1, m2, m3, m4 = st.columns(4)
     
-    # 1. Water to Apply (Removed delta argument entirely)
-    m1.metric("Water to Apply", f"{current_deficit:.2f}\"")
+    # 1. Water to Apply 
+    m1.metric(
+        label="Water to Apply", 
+        value=f"{current_deficit:.2f}\"",
+        help="The current root-zone moisture deficit. This represents the amount of water needed to bring the soil back up to field capacity (full saturation)."
+    )
+    
+    # 2. Allowable Depletion 
+    m2.metric(
+        label="Allowable Depletion", 
+        value=f"{ad_limit:.2f}\"",
+        help="The maximum depth of water (in inches) allowed to deplete from the root zone before plant health experiences drought stress. Calculated via: Root Depth × PAW × MAD%."
+    )
+    
+    # 3. 7-Day ET Forecast 
+    m3.metric(
+        label="7-Day ET Forecast", 
+        value=f"{seven_day_et:.2f}\"",
+        help="The total cumulative atmospheric water loss predicted over the next week. This is the sum of moisture evaporating from the soil and transpiring through the plants."
+    )
+    
+    # 4. 7-Day Rain Forecast 
+    m4.metric(
+        label="7-Day Rain Forecast", 
+        value=f"{seven_day_rain:.2f}\"",
+        help="The total cumulative natural precipitation expected over the next 7 days based on real-time weather coordinates."
+    )
+    
     st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
     st.divider()
-    
-    # 2. Allowable Depletion (Removed delta and delta_color)
-    m2.metric(label="Allowable Depletion", value=f"{ad_limit:.2f}\"")
-    
-    # 3. 7-Day ET Forecast (Removed delta and delta_color)
-    m3.metric("7-Day ET Forecast", f"{seven_day_et:.2f}\"")
-    
-    # 4. 7-Day Rain Forecast (Removed delta)
-    m4.metric("7-Day Rain Forecast", f"{seven_day_rain:.2f}\"")
   
     # Guidance Logic based on Forecast
     if seven_day_rain >  current_deficit and  current_deficit > 0:
@@ -903,7 +1034,7 @@ st.divider()
 st.markdown(
     """
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • v0.33
+        Irrigation Dashboard • v0.34
     </div>
     """, 
     unsafe_allow_html=True
