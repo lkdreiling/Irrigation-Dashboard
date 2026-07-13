@@ -1,2 +1,3 @@
 .cache.sqlite
 .streamlit/
+.cache.sqlite
