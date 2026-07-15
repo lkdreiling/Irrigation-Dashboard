@@ -12,25 +12,61 @@ from sqlalchemy import text
 from retry_requests import retry
 import openmeteo_requests
 
+# Import local business modules
+import core_logic
+import data_manager
+
 # ==============================================================================
 # 0. CONSTANTS, INITIALIZATION & HELPER FUNCTIONS
 # ==============================================================================
 
-# 0.1 Directory Paths & Local Cache Configurations
-DATA_DIR = "IrrigationData"
-BACKUP_DIR = "Backups"
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
-
-PROFILE_FILE = os.path.join(DATA_DIR, "profiles.json")
-LOG_FILE = os.path.join(DATA_DIR, "watering_logs.json")
-WEATHER_LOG = os.path.join(DATA_DIR, "weather_history.json")
-
-# 0.2 Set up Streamlit Session States for Mock/Active User
+# 0.1 Session States & Property Settings
 if "user_id" not in st.session_state:
     st.session_state.user_id = "default_user"
-active_prop = "My Property"
-active_zip = "48894" # Default Zip (Westphalia, MI)
+
+# Load the master property list
+properties_dict = data_manager.load_json(data_manager.PROP_LIST_FILE, {"My Property": "48894"})
+
+# Ensure PROP_LIST_FILE exists on disk
+if not os.path.exists(data_manager.PROP_LIST_FILE):
+    data_manager.save_properties_master(properties_dict)
+
+# Render Property Selector in Sidebar
+st.sidebar.header("🏠 Property Settings")
+
+prop_options = list(properties_dict.keys())
+if "active_prop" not in st.session_state or st.session_state.active_prop not in prop_options:
+    st.session_state.active_prop = prop_options[0]
+
+active_prop = st.sidebar.selectbox("Select Active Property", prop_options, index=prop_options.index(st.session_state.active_prop))
+st.session_state.active_prop = active_prop
+active_zip = properties_dict[active_prop]
+
+# Expandable area to add a new property
+with st.sidebar.expander("➕ Add New Property"):
+    new_prop_name = st.text_input("Property Name", key="new_prop_name_input")
+    new_prop_zip = st.text_input("Zip Code", key="new_prop_zip_input")
+    if st.button("Save Property", use_container_width=True):
+        if new_prop_name.strip() and new_prop_zip.strip():
+            p_name = new_prop_name.strip()
+            p_zip = new_prop_zip.strip()
+            if p_name not in properties_dict:
+                properties_dict[p_name] = p_zip
+                data_manager.save_properties_master(properties_dict)
+                st.session_state.active_prop = p_name
+                st.toast(f"🏡 Property '{p_name}' added!")
+                st.rerun()
+            else:
+                st.error("A property with that name already exists.")
+
+# Dynamic path resolution based on active property
+paths = data_manager.get_prop_paths(active_prop)
+PROFILE_FILE = paths["db"]
+LOG_FILE = paths["log"]
+WEATHER_LOG = paths["weather"]
+DATA_DIR = data_manager.DATA_DIR
+BACKUP_DIR = data_manager.BACKUP_DIR
+
 
 # 0.3 Setup Database Connection (Fallback to Streamlit SQL Connection)
 try:
@@ -47,29 +83,10 @@ except Exception:
         session = MockSession()
     conn = MockConnection()
 
-# 0.4 Soil Physical Constant Reference Table
-# FC = Field Capacity (in/in), PWP = Permanent Wilting Point (in/in)
-SOIL_DATA = {
-    "Sand": {"FC": 0.10, "PWP": 0.05},
-    "Loamy Sand": {"FC": 0.12, "PWP": 0.05},
-    "Sandy Loam": {"FC": 0.18, "PWP": 0.08},
-    "Loam": {"FC": 0.25, "PWP": 0.12},
-    "Silt Loam": {"FC": 0.28, "PWP": 0.14},
-    "Clay Loam": {"FC": 0.32, "PWP": 0.20},
-    "Clay": {"FC": 0.36, "PWP": 0.24}
-}
-
-# 0.5 Helper: Local Zone Profiles I/O
+# 0.4 Helper: Local Zone Profiles I/O using data_manager
 def load_profiles():
     """Loads configured zone settings from local storage or returns a default layout."""
-    if os.path.exists(PROFILE_FILE):
-        try:
-            with open(PROFILE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    # Return initial sample structure if file doesn't exist yet
-    return {
+    default_profile = {
         "Front Lawn": {
             "zip": active_zip,
             "area": 1200,
@@ -80,30 +97,12 @@ def load_profiles():
             "start_date": str(datetime.now().date() - pd.Timedelta(days=7))
         }
     }
+    return data_manager.load_json(PROFILE_FILE, default_profile)
 
 def save_profiles(profiles_dict):
     """Saves structural zone configurations to local JSON."""
-    with open(PROFILE_FILE, "w") as f:
-        json.dump(profiles_dict, f, indent=4)
+    data_manager.save_json(PROFILE_FILE, profiles_dict)
 
-# 0.6 Helper: Calculate Irrigation Soil Depletion Metrics
-def calculate_irrigation_limits(soil_type, depth_inches, mad_percent):
-    """
-    Calculates:
-      1. Available Water capacity per foot (AW in/ft)
-      2. Plant Available Water capacity (PAW inches)
-      3. Allowable Depletion limit (AD inches)
-    """
-    soil = SOIL_DATA.get(soil_type, SOIL_DATA["Loam"])
-    # AW (in/in) = FC - PWP
-    aw_in_in = soil["FC"] - soil["PWP"]
-    # Convert to inches of water per foot of soil depth
-    aw_per_foot = aw_in_in * 12.0
-    # PAW = AW * Root Depth (converted to feet)
-    paw_total = aw_per_foot * (depth_inches / 12.0)
-    # AD = PAW * MAD %
-    ad_limit = paw_total * (mad_percent / 100.0)
-    return aw_per_foot, paw_total, ad_limit
 
 
 # ==============================================================================
@@ -124,22 +123,18 @@ def load_logs():
         df = pd.DataFrame()
     
     # Local JSON Backup Fallback if Database isn't reachable
-    if df.empty and os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, "r") as f:
-                local_data = json.load(f)
-                combined_list = []
-                for z, events in local_data.items():
-                    for ev in events:
-                        combined_list.append({
-                            "zone_name": z,
-                            "log_date": ev["date"],
-                            "minutes": ev["minutes"],
-                            "inches": ev["inches"]
-                        })
-                df = pd.DataFrame(combined_list)
-        except Exception:
-            pass
+    if df.empty:
+        local_data = data_manager.load_json(LOG_FILE, {})
+        combined_list = []
+        for z, events in local_data.items():
+            for ev in events:
+                combined_list.append({
+                    "zone_name": z,
+                    "log_date": ev["date"],
+                    "minutes": ev["minutes"],
+                    "inches": ev["inches"]
+                })
+        df = pd.DataFrame(combined_list)
 
     logs = {}
     if not df.empty:
@@ -181,13 +176,7 @@ def save_log(zone, minutes, inches_applied):
         pass
 
     # Step B: Mirror to local backup JSON
-    local_logs = {}
-    if os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, "r") as f:
-                local_logs = json.load(f)
-        except Exception:
-            pass
+    local_logs = data_manager.load_json(LOG_FILE, {})
     if zone not in local_logs:
         local_logs[zone] = []
     local_logs[zone].append({
@@ -195,8 +184,7 @@ def save_log(zone, minutes, inches_applied):
         "minutes": float(minutes),
         "inches": float(inches_applied)
     })
-    with open(LOG_FILE, "w") as f:
-        json.dump(local_logs, f, indent=4)
+    data_manager.save_json(LOG_FILE, local_logs)
 
     st.cache_data.clear()
 
@@ -204,35 +192,23 @@ def save_log(zone, minutes, inches_applied):
 # 1.3 Archive Weather to Local Storage Cache
 def archive_weather(df_daily):
     """Stores historical daily ET and Rainfall records in a local JSON structure."""
-    history = {}
-    if not os.path.exists(WEATHER_LOG):
-        with open(WEATHER_LOG, "w") as f:
-            json.dump({}, f)
-    if os.path.exists(WEATHER_LOG):
-        with open(WEATHER_LOG, "r") as f: 
-            history = json.load(f)
+    history = data_manager.load_json(WEATHER_LOG, {})
     for _, row in df_daily.iterrows():
         date_str = row['time'].strftime('%Y-%m-%d')
         if row['time'].date() <= datetime.now().date():
             history[date_str] = {"ET0 (in)": row["ET0 (in)"], "Rain (in)": row["Rain (in)"]}
-    with open(WEATHER_LOG, "w") as f: 
-        json.dump(history, f, indent=4)
+    data_manager.save_json(WEATHER_LOG, history)
 
 
 # 1.4 Load Archived Weather History
 def load_weather_history():
     """Loads archived local weather logs and transforms into a DataFrame."""
-    if os.path.exists(WEATHER_LOG):
-        with open(WEATHER_LOG, "r") as f:
-            try:
-                data = json.load(f)
-                if data:
-                    df = pd.DataFrame.from_dict(data, orient='index').reset_index()
-                    df.columns = ['time', 'ET0 (in)', 'Rain (in)']
-                    df['time'] = pd.to_datetime(df['time'])
-                    return df
-            except Exception:
-                pass
+    data = data_manager.load_json(WEATHER_LOG, {})
+    if data:
+        df = pd.DataFrame.from_dict(data, orient='index').reset_index()
+        df.columns = ['time', 'ET0 (in)', 'Rain (in)']
+        df['time'] = pd.to_datetime(df['time'])
+        return df
     return pd.DataFrame(columns=['time', 'ET0 (in)', 'Rain (in)'])
 
 
@@ -382,14 +358,11 @@ with zone_col2:
 
 # 3.5 Geolocation Cache Utility
 @st.cache_data(ttl=3600)
-def get_coords(zip_code):
-    try:
-        res = requests.get(f"http://api.zippopotam.us/us/{zip_code}", timeout=5).json()
-        return float(res['places'][0]['latitude']), float(res['places'][0]['longitude']), f"{res['places'][0]['place name']}"
-    except Exception: 
-        return 42.9286, -84.7981, "Westphalia, MI"
+def get_coords_cached(zip_code):
+    lat, lon, name = core_logic.get_coords(zip_code)
+    return lat, lon
 
-lat, lon, z_name = get_coords(active_zip)
+lat, lon = get_coords_cached(active_zip)
 
 
 # ==============================================================================
@@ -408,12 +381,13 @@ current_start_dt = current_zone.get("start_date", str(datetime.now().date()))
 area = st.sidebar.number_input("Zone Area (sq ft)", min_value=1, value=current_area, step=1, format="%d")
 flow = st.sidebar.number_input("Zone Flow (GPM)", min_value=1, value=current_flow, step=1, format="%d")
 
-soil_types = list(SOIL_DATA.keys())
+soil_types = list(core_logic.SOIL_DATA.keys())
 try:
     soil_index = soil_types.index(saved_soil)
 except ValueError:
     soil_index = soil_types.index("Loam")
 soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
+
 
 depth_in = st.sidebar.slider(
     "Root Depth (in)", 
@@ -495,15 +469,16 @@ st.sidebar.number_input(
 # ==============================================================================
 # 6. MATH ENGINE (PHYSICAL PROPERTY EXTRACTION)
 # ==============================================================================
-aw_per_foot, paw_total, ad_limit = calculate_irrigation_limits(soil_choice, depth_in, mad)
+aw_per_foot, paw_total, ad_limit = core_logic.calculate_irrigation_limits(soil_choice, depth_in, mad)
 
-soil_info = SOIL_DATA.get(soil_choice, SOIL_DATA["Loam"])
+soil_info = core_logic.SOIL_DATA.get(soil_choice, core_logic.SOIL_DATA["Loam"])
 fc_raw = soil_info["FC"]
 pwp_raw = soil_info["PWP"]
 fc_inft = fc_raw * 12
 pwp_inft = pwp_raw * 12
 rz_ft = depth_in / 12
 aw_capacity_inft = (fc_raw - pwp_raw) * 12
+
 
 
 # ==============================================================================
@@ -867,10 +842,10 @@ if all_logs:
                     })
                     
                 if new_logs:
-                    with open(LOG_FILE, "w") as f:
-                        json.dump(new_logs, f, indent=4)
+                    data_manager.save_json(LOG_FILE, new_logs)
                     st.success("Global logs updated and water depths recalculated!")
                     st.rerun()
+
 
             # Global Volume Comparison chart
             st.write("### 📊 Gallons Used per Zone")
