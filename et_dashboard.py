@@ -20,21 +20,169 @@ import data_manager
 # 0. CONSTANTS, INITIALIZATION & HELPER FUNCTIONS
 # ==============================================================================
 
-# 0.1 Session States & Property Settings
-if "user_id" not in st.session_state:
-    st.session_state.user_id = "default_user"
+# Safe local fallback Mock if database credentials are not present in secrets.toml
+class MockConnection:
+    def query(self, query, params=None, ttl=0):
+        # Return empty DataFrame if DB isn't configured so local JSON can take over
+        return pd.DataFrame(columns=['zone_name', 'log_date', 'minutes', 'inches'])
+    class MockSession:
+        def execute(self, *args, **kwargs): pass
+        def commit(self): pass
+    session = MockSession()
 
-# Load the master property list
-properties_dict = data_manager.load_json(data_manager.PROP_LIST_FILE, {"My Property": "48894"})
+# 0.1 Setup Database Connection (Fallback to Streamlit SQL Connection)
+try:
+    conn = st.connection("postgresql", type="sql")
+    # Initialize users table in Postgres if database is online
+    try:
+        with conn.session as session:
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS app_users (
+                    username VARCHAR(50) PRIMARY KEY,
+                    password_hash VARCHAR(256) NOT NULL
+                );
+            """))
+            session.commit()
+    except Exception:
+        pass
+except Exception:
+    conn = MockConnection()
 
-# Ensure PROP_LIST_FILE exists on disk
-if not os.path.exists(data_manager.PROP_LIST_FILE):
-    data_manager.save_properties_master(properties_dict)
+# 0.2 User DB Authentication Helpers
+def db_register_user(username, password):
+    username_lower = username.strip().lower()
+    hashed = data_manager.hash_password(password)
+    # Check if database is mock or real
+    if not isinstance(conn, MockConnection) and hasattr(conn, "session"):
+        try:
+            with conn.session as session:
+                res = session.execute(
+                    text("SELECT 1 FROM app_users WHERE username = :user"),
+                    {"user": username_lower}
+                ).fetchone()
+                if res:
+                    return False
+                session.execute(
+                    text("INSERT INTO app_users (username, password_hash) VALUES (:user, :hash)"),
+                    {"user": username_lower, "hash": hashed}
+                )
+                session.commit()
+                return True
+        except Exception:
+            pass
+    # Fallback to local files
+    return data_manager.register_user_local(username, password)
+
+def db_authenticate_user(username, password):
+    username_lower = username.strip().lower()
+    if not isinstance(conn, MockConnection) and hasattr(conn, "session"):
+        try:
+            with conn.session as session:
+                res = session.execute(
+                    text("SELECT password_hash FROM app_users WHERE username = :user"),
+                    {"user": username_lower}
+                ).fetchone()
+                if not res:
+                    return False
+                stored_hash = res[0]
+                return data_manager.verify_password(password, stored_hash)
+        except Exception:
+            pass
+    # Fallback to local files
+    return data_manager.authenticate_user_local(username, password)
+
+# ==============================================================================
+# USER LOGIN / REGISTRATION FLOW
+# ==============================================================================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🌱 Irrigation Dashboard Login")
+    st.markdown("Welcome! Please log in or sign up to manage your properties and zone configurations.")
+
+    tab_login, tab_signup = st.tabs(["🔒 Login", "📝 Sign Up"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username").strip()
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Log In", use_container_width=True)
+            if submitted:
+                if username and password:
+                    if db_authenticate_user(username, password):
+                        st.session_state.authenticated = True
+                        st.session_state.username = username
+                        st.session_state.user_id = username
+                        st.success(f"Welcome back, {username}!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
+                else:
+                    st.warning("Please fill in all fields.")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            new_username = st.text_input("Choose Username", key="signup_username").strip()
+            new_password = st.text_input("Choose Password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm_password")
+            submitted = st.form_submit_button("Create Account", use_container_width=True)
+            if submitted:
+                if new_username and new_password:
+                    if len(new_username) < 3:
+                        st.error("Username must be at least 3 characters.")
+                    elif new_password != confirm_password:
+                        st.error("Passwords do not match.")
+                    elif len(new_password) < 6:
+                        st.error("Password must be at least 6 characters.")
+                    else:
+                        if db_register_user(new_username, new_password):
+                            st.success("Account created successfully! You can now log in.")
+                        else:
+                            st.error("Username is already taken.")
+                else:
+                    st.warning("Please fill in all fields.")
+    st.stop()
+
+# ==============================================================================
+# PROPERTY CONFIGURATION & SESSION STATE (Authenticated User)
+# ==============================================================================
+user_paths = data_manager.get_user_paths(st.session_state.user_id)
+PROP_LIST_FILE = user_paths["prop_list"]
+
+properties_dict = data_manager.load_json(PROP_LIST_FILE, {})
 
 # Render Property Selector in Sidebar
 st.sidebar.header("🏠 Property Settings")
 
 prop_options = list(properties_dict.keys())
+
+# If the user has no properties, force them to create one
+if not prop_options:
+    st.sidebar.info("👋 Welcome! Create your first property to get started.")
+    new_prop_name = st.sidebar.text_input("Property Name (e.g., Home)", key="first_prop_name")
+    new_prop_zip = st.sidebar.text_input("Zip Code", key="first_prop_zip")
+    if st.sidebar.button("Create Property", use_container_width=True):
+        if new_prop_name.strip() and new_prop_zip.strip():
+            p_name = new_prop_name.strip()
+            p_zip = new_prop_zip.strip()
+            properties_dict[p_name] = p_zip
+            data_manager.save_json(PROP_LIST_FILE, properties_dict)
+            st.session_state.active_prop = p_name
+            st.toast(f"🏡 Property '{p_name}' created!")
+            st.rerun()
+        else:
+            st.sidebar.error("Please enter a valid name and zip code.")
+    
+    st.sidebar.divider()
+    if st.sidebar.button("🚪 Log Out", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.session_state.user_id = "default_user"
+        st.session_state.active_prop = None
+        st.rerun()
+    st.stop()
+
 if "active_prop" not in st.session_state or st.session_state.active_prop not in prop_options:
     st.session_state.active_prop = prop_options[0]
 
@@ -52,36 +200,29 @@ with st.sidebar.expander("➕ Add New Property"):
             p_zip = new_prop_zip.strip()
             if p_name not in properties_dict:
                 properties_dict[p_name] = p_zip
-                data_manager.save_properties_master(properties_dict)
+                data_manager.save_json(PROP_LIST_FILE, properties_dict)
                 st.session_state.active_prop = p_name
                 st.toast(f"🏡 Property '{p_name}' added!")
                 st.rerun()
             else:
                 st.error("A property with that name already exists.")
 
-# Dynamic path resolution based on active property
-paths = data_manager.get_prop_paths(active_prop)
+# Logout button
+if st.sidebar.button("🚪 Log Out", use_container_width=True):
+    st.session_state.authenticated = False
+    st.session_state.username = None
+    st.session_state.user_id = "default_user"
+    st.session_state.active_prop = None
+    st.rerun()
+
+# Dynamic path resolution based on active property and user
+paths = data_manager.get_prop_paths_for_user(st.session_state.user_id, active_prop)
 PROFILE_FILE = paths["db"]
 LOG_FILE = paths["log"]
 WEATHER_LOG = paths["weather"]
 DATA_DIR = data_manager.DATA_DIR
 BACKUP_DIR = data_manager.BACKUP_DIR
 
-
-# 0.3 Setup Database Connection (Fallback to Streamlit SQL Connection)
-try:
-    conn = st.connection("postgresql", type="sql")
-except Exception:
-    # Safe local fallback Mock if database credentials are not present in secrets.toml
-    class MockConnection:
-        def query(self, query, params=None, ttl=0):
-            # Return empty DataFrame if DB isn't configured so local JSON can take over
-            return pd.DataFrame(columns=['zone_name', 'log_date', 'minutes', 'inches'])
-        class MockSession:
-            def execute(self, *args, **kwargs): pass
-            def commit(self): pass
-        session = MockSession()
-    conn = MockConnection()
 
 # 0.4 Helper: Local Zone Profiles I/O using data_manager
 def load_profiles():
@@ -700,7 +841,7 @@ with st.expander("📈 View Water Balance Graph", expanded=True):
         # Define Unified Interactive X-Axis Scale
         x_axis = alt.X('time:T', 
                        title='Date', 
-                       scale=alt.Scale(domain=[view_start, view_end]),
+                       scale=alt.Scale(domain=[view_start.strftime('%Y-%m-%d'), view_end.strftime('%Y-%m-%d')]),
                        axis=alt.Axis(format='%b %d'))
 
         # Chart Layer A: Evapotranspiration Line
@@ -712,14 +853,14 @@ with st.expander("📈 View Water Balance Graph", expanded=True):
 
         # Chart Layer B: Rainfall Bars
         rain_chart = alt.Chart(df_zoom).mark_bar(opacity=0.5, color='#ADD8E6').encode(
-            x='time:T',
+            x=x_axis,
             y='Rain (in):Q',
             tooltip=['time:T', 'Rain (in):Q']
         )
 
         # Chart Layer C: Irrigation Events
         irr_chart = alt.Chart(df_zoom).mark_bar(size=10, color='#003366').encode(
-            x='time:T',
+            x=x_axis,
             y='Irrigation (in):Q',
             tooltip=['time:T', 'Irrigation (in):Q']
         )
@@ -727,7 +868,8 @@ with st.expander("📈 View Water Balance Graph", expanded=True):
         # Chart Layer D: Today Reference Marker
         today_line = alt.Chart(pd.DataFrame({'time': [now_dt]})).mark_rule(
             color='red', strokeDash=[5,5], strokeWidth=2
-        ).encode(x='time:T')
+        ).encode(x=x_axis)
+
 
         # Combine, render, and freeze scale properties to prevent scrolling issues
         final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
