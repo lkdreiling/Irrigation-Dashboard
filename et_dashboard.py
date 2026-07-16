@@ -346,7 +346,11 @@ def load_weather_history():
     """Loads archived local weather logs and transforms into a DataFrame."""
     data = data_manager.load_json(WEATHER_LOG, {})
     if data:
-        df = pd.DataFrame.from_dict(data, orient='index').reset_index()
+        # Exclude reserved metadata keys (e.g. rate-limit timestamp)
+        weather_data = {k: v for k, v in data.items() if not k.startswith("__")}
+        if not weather_data:
+            return pd.DataFrame(columns=['time', 'ET0 (in)', 'Rain (in)'])
+        df = pd.DataFrame.from_dict(weather_data, orient='index').reset_index()
         df.columns = ['time', 'ET0 (in)', 'Rain (in)']
         df['time'] = pd.to_datetime(df['time'])
         return df
@@ -627,14 +631,41 @@ aw_capacity_inft = (fc_raw - pwp_raw) * 12
 # ==============================================================================
 
 # 7.1 Setup API Sessions
-cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+cache_session = requests_cache.CachedSession('.cache', expire_after=300)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
 
 
 # 7.2 Core Integrated Fetching Routine
-@st.cache_data(ttl=3600)
-def fetch_weather_integrated(lat, lon, start_date_str):
+# Rate-limit key stored inside the weather JSON under a reserved "__last_fetch__" key.
+API_COOLDOWN_SECONDS = 300  # 5 minutes
+
+def _is_api_cooldown_active(weather_log_path):
+    """Returns True if the last successful API call was less than API_COOLDOWN_SECONDS ago."""
+    meta = data_manager.load_json(weather_log_path, {})
+    last_fetch_str = meta.get("__last_fetch__")
+    if last_fetch_str:
+        try:
+            last_fetch = datetime.fromisoformat(last_fetch_str)
+            elapsed = (datetime.now() - last_fetch).total_seconds()
+            return elapsed < API_COOLDOWN_SECONDS
+        except Exception:
+            pass
+    return False
+
+def _record_api_fetch(weather_log_path):
+    """Stamps the current timestamp into the weather JSON so cooldown persists across restarts."""
+    meta = data_manager.load_json(weather_log_path, {})
+    meta["__last_fetch__"] = datetime.now().isoformat()
+    data_manager.save_json(weather_log_path, meta)
+
+@st.cache_data(ttl=300)
+def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
+    # --- Persistent rate-limit guard ---
+    if _is_api_cooldown_active(weather_log_path):
+        # Return None so the caller falls back to locally archived data
+        return None
+
     start_dt = pd.to_datetime(start_date_str).date()
     today = datetime.now().date()
     days_back = (today - start_dt).days
@@ -701,6 +732,8 @@ def fetch_weather_integrated(lat, lon, start_date_str):
             df_daily['time'] = df_daily['time'].dt.tz_convert(None)
             
         df_daily['time'] = df_daily['time'].dt.normalize()
+        # Record the successful fetch so the cooldown timer starts now
+        _record_api_fetch(weather_log_path)
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
         
     except Exception as e:
@@ -710,12 +743,17 @@ def fetch_weather_integrated(lat, lon, start_date_str):
 
 # 7.3 Weather Processing and Data Merger
 zone_start_date_str = current_zone.get("start_date", str(datetime.now().date() - pd.Timedelta(days=7)))
-df_api = fetch_weather_integrated(lat, lon, zone_start_date_str)
+df_api = fetch_weather_integrated(lat, lon, zone_start_date_str, WEATHER_LOG)
 
+# Always load the local archive as the base; merge fresh API data if available
+df_permanent = load_weather_history()
 if df_api is not None:
     archive_weather(df_api)
-    df_permanent = load_weather_history()
+    df_permanent = load_weather_history()  # reload after archiving
     df_daily = pd.concat([df_permanent, df_api]).drop_duplicates(subset='time', keep='last').sort_values('time')
+elif not df_permanent.empty:
+    df_daily = df_permanent.sort_values('time')
+if df_api is not None or not df_permanent.empty:
     df_daily['time'] = pd.to_datetime(df_daily['time']).dt.normalize()
     
     # Enforce threshold constraints to retain structural history
