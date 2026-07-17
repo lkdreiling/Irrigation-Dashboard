@@ -13,3 +13,4 @@ Backups/
 .streamlit/
 .streamlit/secrets.toml
 
+*.sqlite

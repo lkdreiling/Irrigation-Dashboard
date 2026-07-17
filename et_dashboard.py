@@ -930,35 +930,8 @@ openmeteo = openmeteo_requests.Client(session=retry_session)
 
 
 # 7.2 Core Integrated Fetching Routine
-# Rate-limit key stored inside the weather JSON under a reserved "__last_fetch__" key.
-API_COOLDOWN_SECONDS = 300  # 5 minutes
-
-def _is_api_cooldown_active(weather_log_path):
-    """Returns True if the last successful API call was less than API_COOLDOWN_SECONDS ago."""
-    meta = data_manager.load_json(weather_log_path, {})
-    last_fetch_str = meta.get("__last_fetch__")
-    if last_fetch_str:
-        try:
-            last_fetch = datetime.fromisoformat(last_fetch_str)
-            elapsed = (datetime.now() - last_fetch).total_seconds()
-            return elapsed < API_COOLDOWN_SECONDS
-        except Exception:
-            pass
-    return False
-
-def _record_api_fetch(weather_log_path):
-    """Stamps the current timestamp into the weather JSON so cooldown persists across restarts."""
-    meta = data_manager.load_json(weather_log_path, {})
-    meta["__last_fetch__"] = datetime.now().isoformat()
-    data_manager.save_json(weather_log_path, meta)
-
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=900)
 def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
-    # --- Persistent rate-limit guard ---
-    if _is_api_cooldown_active(weather_log_path):
-        # Return None so the caller falls back to locally archived data
-        return None
-
     start_dt = pd.to_datetime(start_date_str).date()
     today = datetime.now().date()
     days_back = (today - start_dt).days
@@ -1025,8 +998,6 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             df_daily['time'] = df_daily['time'].dt.tz_convert(None)
             
         df_daily['time'] = df_daily['time'].dt.normalize()
-        # Record the successful fetch so the cooldown timer starts now
-        _record_api_fetch(weather_log_path)
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
         
     except Exception as e:
