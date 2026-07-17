@@ -4,7 +4,7 @@
         "area": 2000,
         "flow": 20,
         "soil": "Loam",
-        "depth": 6,
+        "depth": 2,
         "mad": 50,
         "start_date": "2026-07-08"
     }

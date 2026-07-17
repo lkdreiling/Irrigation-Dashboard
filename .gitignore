@@ -1,4 +1,15 @@
+# Local runtime / cache artifacts
 .cache.sqlite
+.cache/
+__pycache__/
+*.pyc
+*.pkl
+
+# Local data directories that should not be versioned
+IrrigationData/
+Backups/
+
+# Streamlit secrets remain local-only
 .streamlit/
-.cache.sqlite
-.cache.sqlite
+.streamlit/secrets.toml
+

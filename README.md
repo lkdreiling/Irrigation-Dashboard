@@ -1,4 +1,4 @@
-# 🌱 Irrigation Dashboard v0.34
+# 🌱 Irrigation Dashboard v0.35
 
 Irrigation Dashboard is a localized, web-based Evapotranspiration (ET) application that helps you manage lawn and garden watering with precision. By pulling real-time weather data and calculating soil moisture depletion, it tells you exactly **when** to water and **how much** to apply.
 
@@ -7,10 +7,27 @@ Irrigation Dashboard is a localized, web-based Evapotranspiration (ET) applicati
 The easiest way to use the dashboard is directly through your web browser via **Streamlit Cloud**:
 
 1. **Launch the App:** Open your deployment URL (e.g., `https://your-app-name.streamlit.app`).
-2. **Configure Your Property:** Click on the **Property Settings** panel to input your local Zip Code.
-3. **Add Zones:** Fill out your crop/landscape characteristics, square footage, and irrigation flow rates to begin calculations immediately.
+2. **Add Secrets in Streamlit Cloud:** Set your deployment secrets in the Streamlit Cloud UI using the same keys expected by the app.
+3. **Configure Your Property:** Click on the **Property Settings** panel to input your local Zip Code.
+4. **Add Zones:** Fill out your crop/landscape characteristics, square footage, and irrigation flow rates to begin calculations immediately.
 
 *Note: Your session data is completely isolated. Test parameters or modifications made by other active sessions will not leak into or override your configuration profiles.*
+
+### Deployment Secrets
+
+The repository intentionally does not commit secret values. Keep the local secret file private and use the Streamlit Cloud secrets manager for hosted deployment.
+
+Example shape for hosted configuration:
+
+```toml
+[connections.postgresql]
+url = "postgresql://..."
+
+[supabase]
+url = "https://your-project.supabase.co"
+anon_key = "your-anon-key"
+service_role_key = "your-service-role-key"
+```
 
 ## 🛠️ How it Works
 

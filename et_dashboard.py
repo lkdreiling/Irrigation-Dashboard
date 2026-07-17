@@ -20,6 +20,22 @@ import data_manager
 # 0. CONSTANTS, INITIALIZATION & HELPER FUNCTIONS
 # ==============================================================================
 
+# Optional local-only Supabase configuration. This keeps the app usable even when
+# the user has not yet configured shared cloud storage.
+SUPABASE_CONFIG = {}
+try:
+    supabase_block = st.secrets.get("supabase", {})
+    if isinstance(supabase_block, dict):
+        SUPABASE_CONFIG = {
+            "url": supabase_block.get("url") or os.getenv("SUPABASE_URL"),
+            "anon_key": supabase_block.get("anon_key") or os.getenv("SUPABASE_ANON_KEY"),
+            "service_role_key": supabase_block.get("service_role_key") or os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+        }
+except Exception:
+    SUPABASE_CONFIG = {}
+
+SUPABASE_READY = bool(SUPABASE_CONFIG.get("url") and SUPABASE_CONFIG.get("anon_key"))
+
 # Safe local fallback Mock if database credentials are not present in secrets.toml
 class MockConnection:
     def query(self, query, params=None, ttl=0):
@@ -33,13 +49,45 @@ class MockConnection:
 # 0.1 Setup Database Connection (Fallback to Streamlit SQL Connection)
 try:
     conn = st.connection("postgresql", type="sql")
-    # Initialize users table in Postgres if database is online
+    # Initialize shared cloud tables in Postgres if database is online
     try:
         with conn.session as session:
             session.execute(text("""
                 CREATE TABLE IF NOT EXISTS app_users (
                     username VARCHAR(50) PRIMARY KEY,
                     password_hash VARCHAR(256) NOT NULL
+                );
+            """))
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS properties (
+                    user_id VARCHAR(100) NOT NULL,
+                    property_name VARCHAR(100) NOT NULL,
+                    zip_code VARCHAR(20) NOT NULL,
+                    PRIMARY KEY (user_id, property_name)
+                );
+            """))
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS zones (
+                    user_id VARCHAR(100) NOT NULL,
+                    property_name VARCHAR(100) NOT NULL,
+                    zone_name VARCHAR(100) NOT NULL,
+                    area INTEGER NOT NULL DEFAULT 1000,
+                    flow NUMERIC NOT NULL DEFAULT 5,
+                    soil VARCHAR(50) NOT NULL DEFAULT 'Loam',
+                    depth INTEGER NOT NULL DEFAULT 12,
+                    mad INTEGER NOT NULL DEFAULT 50,
+                    start_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                    PRIMARY KEY (user_id, property_name, zone_name)
+                );
+            """))
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS watering_logs (
+                    user_id VARCHAR(100) NOT NULL,
+                    property_name VARCHAR(100) NOT NULL,
+                    zone_name VARCHAR(100) NOT NULL,
+                    log_date DATE NOT NULL,
+                    minutes NUMERIC NOT NULL,
+                    inches NUMERIC NOT NULL
                 );
             """))
             session.commit()
@@ -94,6 +142,158 @@ def db_authenticate_user(username, password):
 # ==============================================================================
 # USER LOGIN / REGISTRATION FLOW
 # ==============================================================================
+
+def load_properties_from_cloud():
+    """Loads a user's property list from the shared Postgres/Supabase cloud table if available."""
+    if isinstance(conn, MockConnection):
+        return None
+    try:
+        df = conn.query(
+            "SELECT property_name, zip_code FROM properties WHERE user_id = :user_id",
+            params={"user_id": st.session_state.user_id},
+            ttl=0,
+        )
+        if not df.empty:
+            return df.set_index("property_name")["zip_code"].to_dict()
+    except Exception:
+        return None
+    return None
+
+
+def save_property_to_cloud(prop_name, zip_code):
+    """Stores a user's property in the shared cloud table when the SQL connection is available."""
+    if isinstance(conn, MockConnection):
+        return
+    try:
+        with conn.session as session:
+            session.execute(text("""
+                INSERT INTO properties (user_id, property_name, zip_code)
+                VALUES (:user_id, :prop_name, :zip_code)
+                ON CONFLICT (user_id, property_name)
+                DO UPDATE SET zip_code = EXCLUDED.zip_code;
+            """), {
+                "user_id": st.session_state.user_id,
+                "prop_name": prop_name,
+                "zip_code": zip_code,
+            })
+            session.commit()
+    except Exception:
+        pass
+
+
+def load_profiles_from_cloud(active_property):
+    """Loads a user's zone profiles from the shared Postgres/Supabase cloud table if available."""
+    if isinstance(conn, MockConnection):
+        return None
+    try:
+        df = conn.query(
+            """
+                SELECT zone_name, area, flow, soil, depth, mad, start_date
+                FROM zones
+                WHERE user_id = :user_id AND property_name = :property_name
+            """,
+            params={"user_id": st.session_state.user_id, "property_name": active_property},
+            ttl=0,
+        )
+        if not df.empty:
+            zone_dict = {}
+            for _, row in df.iterrows():
+                zone_dict[row["zone_name"]] = {
+                    "zip": active_zip,
+                    "area": int(row["area"]),
+                    "flow": float(row["flow"]),
+                    "soil": row["soil"],
+                    "depth": int(row["depth"]),
+                    "mad": int(row["mad"]),
+                    "start_date": str(row["start_date"]),
+                }
+            return zone_dict
+    except Exception:
+        return None
+    return None
+
+
+def save_profiles_to_cloud(profiles_dict, active_property):
+    """Stores the current zone profile set under the shared cloud table, scoped to the user and property."""
+    if isinstance(conn, MockConnection):
+        return
+    try:
+        with conn.session as session:
+            for zone_name, config in profiles_dict.items():
+                session.execute(text("""
+                    INSERT INTO zones (
+                        user_id, property_name, zone_name, area, flow, soil, depth, mad, start_date
+                    )
+                    VALUES (
+                        :user_id, :property_name, :zone_name, :area, :flow, :soil, :depth, :mad, :start_date
+                    )
+                    ON CONFLICT (user_id, property_name, zone_name)
+                    DO UPDATE SET
+                        area = EXCLUDED.area,
+                        flow = EXCLUDED.flow,
+                        soil = EXCLUDED.soil,
+                        depth = EXCLUDED.depth,
+                        mad = EXCLUDED.mad,
+                        start_date = EXCLUDED.start_date;
+                """), {
+                    "user_id": st.session_state.user_id,
+                    "property_name": active_property,
+                    "zone_name": zone_name,
+                    "area": int(config.get("area", 1000)),
+                    "flow": float(config.get("flow", 5)),
+                    "soil": config.get("soil", "Loam"),
+                    "depth": int(config.get("depth", 12)),
+                    "mad": int(config.get("mad", 50)),
+                    "start_date": config.get("start_date", str(datetime.now().date())),
+                })
+            session.commit()
+    except Exception:
+        pass
+
+
+def load_logs_from_cloud(active_property):
+    """Loads watering history for the current user/property from the shared cloud table when available."""
+    if isinstance(conn, MockConnection):
+        return None
+    try:
+        df = conn.query(
+            """
+                SELECT zone_name, log_date, minutes, inches
+                FROM watering_logs
+                WHERE user_id = :user_id AND property_name = :property_name
+            """,
+            params={"user_id": st.session_state.user_id, "property_name": active_property},
+            ttl=0,
+        )
+        if not df.empty:
+            return df
+    except Exception:
+        return None
+    return None
+
+
+def save_log_to_cloud(zone_name, minutes, inches_applied, active_property):
+    """Mirrors a watering event into the shared cloud table when the SQL connection is available."""
+    if isinstance(conn, MockConnection):
+        return
+    try:
+        with conn.session as session:
+            session.execute(text("""
+                INSERT INTO watering_logs (user_id, property_name, zone_name, log_date, minutes, inches)
+                VALUES (:user_id, :property_name, :zone_name, :log_date, :minutes, :inches);
+            """), {
+                "user_id": st.session_state.user_id,
+                "property_name": active_property,
+                "zone_name": zone_name,
+                "log_date": datetime.now().date(),
+                "minutes": float(minutes),
+                "inches": float(inches_applied),
+            })
+            session.commit()
+    except Exception:
+        pass
+
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -150,11 +350,10 @@ if not st.session_state.authenticated:
 user_paths = data_manager.get_user_paths(st.session_state.user_id)
 PROP_LIST_FILE = user_paths["prop_list"]
 
-properties_dict = data_manager.load_json(PROP_LIST_FILE, {})
+properties_dict = load_properties_from_cloud() or data_manager.load_json(PROP_LIST_FILE, {})
 
 # Render Property Selector in Sidebar
 st.sidebar.header("🏠 Property Settings")
-
 prop_options = list(properties_dict.keys())
 
 # If the user has no properties, force them to create one
@@ -168,6 +367,7 @@ if not prop_options:
             p_zip = new_prop_zip.strip()
             properties_dict[p_name] = p_zip
             data_manager.save_json(PROP_LIST_FILE, properties_dict)
+            save_property_to_cloud(p_name, p_zip)
             st.session_state.active_prop = p_name
             st.toast(f"🏡 Property '{p_name}' created!")
             st.rerun()
@@ -201,6 +401,7 @@ with st.sidebar.expander("➕ Add New Property"):
             if p_name not in properties_dict:
                 properties_dict[p_name] = p_zip
                 data_manager.save_json(PROP_LIST_FILE, properties_dict)
+                save_property_to_cloud(p_name, p_zip)
                 st.session_state.active_prop = p_name
                 st.toast(f"🏡 Property '{p_name}' added!")
                 st.rerun()
@@ -224,9 +425,85 @@ DATA_DIR = data_manager.DATA_DIR
 BACKUP_DIR = data_manager.BACKUP_DIR
 
 
+def load_profiles_from_supabase():
+    """Loads zone profiles from the verified live Supabase/Postgres SQL connection if available."""
+    if isinstance(conn, MockConnection) or not hasattr(conn, "query"):
+        return None
+    if not active_prop:
+        return None
+    try:
+        df = conn.query(
+            """
+                SELECT zone_name, area, flow, soil, depth, mad, start_date
+                FROM zones
+                WHERE user_id = :user_id
+                  AND property_name = :property_name
+            """,
+            params={"user_id": st.session_state.user_id, "property_name": active_prop},
+            ttl=0,
+        )
+        if df.empty:
+            return None
+
+        profiles_from_cloud = {}
+        for _, row in df.iterrows():
+            zone_name = row.get("zone_name")
+            if zone_name:
+                profiles_from_cloud[zone_name] = {
+                    "zip": active_zip,
+                    "area": int(row.get("area", 1000)),
+                    "flow": float(row.get("flow", 5)),
+                    "soil": row.get("soil", "Loam"),
+                    "depth": int(row.get("depth", 12)),
+                    "mad": int(row.get("mad", 50)),
+                    "start_date": str(row.get("start_date", str(datetime.now().date()))),
+                }
+        return profiles_from_cloud if profiles_from_cloud else None
+    except Exception:
+        return None
+
+
+def save_profiles_to_supabase(profiles_dict):
+    """Best-effort mirror of zone profiles to the live SQL connection used by Supabase."""
+    if isinstance(conn, MockConnection) or not hasattr(conn, "session"):
+        return
+    try:
+        with conn.session as session:
+            for zone_name, config in profiles_dict.items():
+                session.execute(text("""
+                    INSERT INTO zones (
+                        user_id, property_name, zone_name, area, flow, soil, depth, mad, start_date
+                    )
+                    VALUES (
+                        :user_id, :property_name, :zone_name, :area, :flow, :soil, :depth, :mad, :start_date
+                    )
+                    ON CONFLICT (user_id, property_name, zone_name)
+                    DO UPDATE SET
+                        area = EXCLUDED.area,
+                        flow = EXCLUDED.flow,
+                        soil = EXCLUDED.soil,
+                        depth = EXCLUDED.depth,
+                        mad = EXCLUDED.mad,
+                        start_date = EXCLUDED.start_date;
+                """), {
+                    "user_id": st.session_state.user_id,
+                    "property_name": active_prop,
+                    "zone_name": zone_name,
+                    "area": int(config.get("area", 1000)),
+                    "flow": float(config.get("flow", 5)),
+                    "soil": config.get("soil", "Loam"),
+                    "depth": int(config.get("depth", 12)),
+                    "mad": int(config.get("mad", 50)),
+                    "start_date": config.get("start_date", str(datetime.now().date())),
+                })
+            session.commit()
+    except Exception:
+        pass
+
+
 # 0.4 Helper: Local Zone Profiles I/O using data_manager
 def load_profiles():
-    """Loads configured zone settings from local storage or returns a default layout."""
+    """Loads configured zone settings from Supabase when available, otherwise local JSON fallback."""
     default_profile = {
         "Front Lawn": {
             "zip": active_zip,
@@ -238,12 +515,15 @@ def load_profiles():
             "start_date": str(datetime.now().date() - pd.Timedelta(days=7))
         }
     }
+    cloud_profiles = load_profiles_from_supabase()
+    if cloud_profiles is not None:
+        return cloud_profiles
     return data_manager.load_json(PROFILE_FILE, default_profile)
 
 def save_profiles(profiles_dict):
-    """Saves structural zone configurations to local JSON."""
+    """Saves structural zone configurations to local JSON and mirrors to Supabase if configured."""
     data_manager.save_json(PROFILE_FILE, profiles_dict)
-
+    save_profiles_to_supabase(profiles_dict)
 
 
 # ==============================================================================
@@ -252,30 +532,34 @@ def save_profiles(profiles_dict):
 
 # 1.1 Load Zone Logs from Database
 def load_logs():
-    """Pulls watering history matching this property and active user."""
-    query = """
-        SELECT zone_name, log_date, minutes, inches 
-        FROM watering_logs 
-        WHERE property = :prop AND user_id = :user_id
-    """
-    try:
-        df = conn.query(query, params={"prop": active_prop, "user_id": st.session_state.user_id}, ttl=0)
-    except Exception:
-        df = pd.DataFrame()
-    
-    # Local JSON Backup Fallback if Database isn't reachable
-    if df.empty:
-        local_data = data_manager.load_json(LOG_FILE, {})
-        combined_list = []
-        for z, events in local_data.items():
-            for ev in events:
-                combined_list.append({
-                    "zone_name": z,
-                    "log_date": ev["date"],
-                    "minutes": ev["minutes"],
-                    "inches": ev["inches"]
-                })
-        df = pd.DataFrame(combined_list)
+    """Pulls watering history matching this property and active user from shared cloud storage when available."""
+    cloud_df = load_logs_from_cloud(active_prop)
+    if cloud_df is not None and not cloud_df.empty:
+        df = cloud_df
+    else:
+        query = """
+            SELECT zone_name, log_date, minutes, inches 
+            FROM watering_logs 
+            WHERE property_name = :prop AND user_id = :user_id
+        """
+        try:
+            df = conn.query(query, params={"prop": active_prop, "user_id": st.session_state.user_id}, ttl=0)
+        except Exception:
+            df = pd.DataFrame()
+        
+        # Local JSON Backup Fallback if Database isn't reachable
+        if df.empty:
+            local_data = data_manager.load_json(LOG_FILE, {})
+            combined_list = []
+            for z, events in local_data.items():
+                for ev in events:
+                    combined_list.append({
+                        "zone_name": z,
+                        "log_date": ev["date"],
+                        "minutes": ev["minutes"],
+                        "inches": ev["inches"]
+                    })
+            df = pd.DataFrame(combined_list)
 
     logs = {}
     if not df.empty:
@@ -293,12 +577,12 @@ def load_logs():
 
 # 1.2 Save Local Log to Database & JSON Backup
 def save_log(zone, minutes, inches_applied):
-    """Inserts a verified watering event into PostgreSQL and mirrors to local backup."""
+    """Inserts a verified watering event into the shared cloud table when available and mirrors to local backup."""
     # Step A: Push to SQL Connection if online
     try:
         with conn.session as session:
             query = text("""
-                INSERT INTO watering_logs (user_id, property, zone_name, log_date, minutes, inches)
+                INSERT INTO watering_logs (user_id, property_name, zone_name, log_date, minutes, inches)
                 VALUES (:user_id, :prop, :zone, :date, :mins, :inches);
             """)
             session.execute(
@@ -315,6 +599,8 @@ def save_log(zone, minutes, inches_applied):
             session.commit()
     except Exception:
         pass
+
+    save_log_to_cloud(zone, minutes, inches_applied, active_prop)
 
     # Step B: Mirror to local backup JSON
     local_logs = data_manager.load_json(LOG_FILE, {})
@@ -360,6 +646,13 @@ def load_weather_history():
 # ==============================================================================
 # 2. APPLICATION INITIALIZATION
 # ==============================================================================
+
+mode_label = "☁️ Cloud sync active" if SUPABASE_READY else "💾 Local-only mode"
+st.markdown(
+    f"<div style='padding:8px 12px; background:#f0f2f6; border-radius:8px; margin-bottom:12px;'>"
+    f"<strong>Irrigation Dashboard</strong> — <span>{mode_label}</span> — <em>v0.35</em></div>",
+    unsafe_allow_html=True,
+)
 
 # 2.1 Load Local App Profiles
 profiles = load_profiles()
@@ -481,11 +774,11 @@ with zone_col2:
             try:
                 with conn.session as session:
                     session.execute(
-                        text("DELETE FROM zone_profiles WHERE property = :prop AND zone_name = :zone AND user_id = :user_id"),
+                        text("DELETE FROM zones WHERE property_name = :prop AND zone_name = :zone AND user_id = :user_id"),
                         {"prop": active_prop, "zone": active_zone_name, "user_id": st.session_state.user_id}
                     )
                     session.execute(
-                        text("DELETE FROM watering_logs WHERE property = :prop AND zone_name = :zone AND user_id = :user_id"),
+                        text("DELETE FROM watering_logs WHERE property_name = :prop AND zone_name = :zone AND user_id = :user_id"),
                         {"prop": active_prop, "zone": active_zone_name, "user_id": st.session_state.user_id}
                     )
                     session.commit()
@@ -1169,11 +1462,12 @@ with st.expander("🛡️ Data Security & Backups"):
 
 # Footer Branding
 st.divider()
+mode_text = "cloud" if SUPABASE_READY else "local"
 st.markdown(
-    """
+    f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • v0.34
+        Irrigation Dashboard • {mode_text} • v0.35
     </div>
-    """, 
+    """,
     unsafe_allow_html=True
 )
