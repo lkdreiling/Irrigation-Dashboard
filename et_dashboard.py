@@ -1,226 +1,672 @@
-import streamlit as st
-import pandas as pd
-import requests
-import json
 import os
-import shutil
-import altair as alt
-from datetime import datetime
-import openmeteo_requests
+import json
+import requests
 import requests_cache
-from retry_requests import retry
-from datetime import timedelta
+import platform
+import shutil
+from datetime import datetime
+import pandas as pd
+import altair as alt
+import streamlit as st
 from sqlalchemy import text
+from retry_requests import retry
+import openmeteo_requests
 
+# Import local business modules
+import core_logic
+import data_manager
 
-#### 1.0 IMPORT YOUR CUSTOM MODULES  
-from data_manager import (
-    load_json, save_json, get_prop_paths, 
-    PROP_LIST_FILE, DATA_DIR, SYSTEM_DIR, BACKUP_DIR,  
-    save_properties_master  
-)
-from core_logic import SOIL_DATA, get_coords, calculate_irrigation_limits
+# ==============================================================================
+# 0. CONSTANTS, INITIALIZATION & HELPER FUNCTIONS
+# ==============================================================================
 
-#### 1.1 Page Configuration
-st.set_page_config(page_title="Irrigation Dashboard", layout="wide", page_icon="🌱")
-conn = st.connection("postgresql", type="sql")
-st.markdown("""
-    <style>
-        .block-container {
-            padding-top: 2rem;
-            padding-bottom: 0rem;
-            margin-top: 0rem;
+# Optional local-only Supabase configuration. This keeps the app usable even when
+# the user has not yet configured shared cloud storage.
+SUPABASE_CONFIG = {}
+try:
+    supabase_block = st.secrets.get("supabase", {})
+    if isinstance(supabase_block, dict):
+        SUPABASE_CONFIG = {
+            "url": supabase_block.get("url") or os.getenv("SUPABASE_URL"),
+            "anon_key": supabase_block.get("anon_key") or os.getenv("SUPABASE_ANON_KEY"),
+            "service_role_key": supabase_block.get("service_role_key") or os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
         }
-    </style>
-""", unsafe_allow_html=True)
-st.title("🌱 Irrigation Dashboard")
+except Exception:
+    SUPABASE_CONFIG = {}
 
-#### 1.2 User location
-# --- TRACKING VISITOR IP FOR LOCAL ZIP ---
-@st.cache_data(ttl=86400)  # Cache for 24 hours so it doesn't spam the API on every click
-def get_visitor_zip():
+SUPABASE_READY = bool(SUPABASE_CONFIG.get("url") and SUPABASE_CONFIG.get("anon_key"))
+
+# Safe local fallback Mock if database credentials are not present in secrets.toml
+class MockConnection:
+    def query(self, query, params=None, ttl=0):
+        # Return empty DataFrame if DB isn't configured so local JSON can take over
+        return pd.DataFrame(columns=['zone_name', 'log_date', 'minutes', 'inches'])
+    class MockSession:
+        def execute(self, *args, **kwargs): pass
+        def commit(self): pass
+    session = MockSession()
+
+# 0.1 Setup Database Connection (Fallback to Streamlit SQL Connection)
+try:
+    conn = st.connection("postgresql", type="sql")
+    # Initialize shared cloud tables in Postgres if database is online
     try:
-        # Uses a free, secure geo-IP service that reads the user's browser connection
-        response = requests.get("https://ipapi.co/json/", timeout=3).json()
-        detected_zip = response.get("postal")
-        if detected_zip and len(detected_zip) == 5:
-            return str(detected_zip)
+        with conn.session as session:
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS app_users (
+                    username VARCHAR(50) PRIMARY KEY,
+                    password_hash VARCHAR(256) NOT NULL
+                );
+            """))
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS properties (
+                    user_id VARCHAR(100) NOT NULL,
+                    property_name VARCHAR(100) NOT NULL,
+                    zip_code VARCHAR(20) NOT NULL,
+                    PRIMARY KEY (user_id, property_name)
+                );
+            """))
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS zones (
+                    user_id VARCHAR(100) NOT NULL,
+                    property_name VARCHAR(100) NOT NULL,
+                    zone_name VARCHAR(100) NOT NULL,
+                    area INTEGER NOT NULL DEFAULT 1000,
+                    flow NUMERIC NOT NULL DEFAULT 5,
+                    soil VARCHAR(50) NOT NULL DEFAULT 'Loam',
+                    depth INTEGER NOT NULL DEFAULT 12,
+                    mad INTEGER NOT NULL DEFAULT 50,
+                    start_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                    PRIMARY KEY (user_id, property_name, zone_name)
+                );
+            """))
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS watering_logs (
+                    user_id VARCHAR(100) NOT NULL,
+                    property_name VARCHAR(100) NOT NULL,
+                    zone_name VARCHAR(100) NOT NULL,
+                    log_date DATE NOT NULL,
+                    minutes NUMERIC NOT NULL,
+                    inches NUMERIC NOT NULL
+                );
+            """))
+            session.commit()
     except Exception:
         pass
-    return "66502"  # Reliable fallback (Manhattan, KS) if they block location tracking
+except Exception:
+    conn = MockConnection()
 
-# Automatically fetch the manager's local zip code on load
-default_local_zip = get_visitor_zip()
-
-# Initialize Session State using their local zip code dynamically
-if 'prop_master' not in st.session_state:
-    st.session_state.prop_master = load_json(PROP_LIST_FILE, {"Home": default_local_zip})
-
-# --- TOP NAVIGATION: Dropdown & Settings ---
-head_col1, head_col2 = st.columns([3, 1])
-
-with head_col1:
-    # Pull the list of names from our dictionary keys
-    prop_names = list(st.session_state.prop_master.keys())
-    active_prop = st.selectbox("Select Property", prop_names, label_visibility="collapsed")
-    # Get the zip associated with that property name
-    active_zip = st.session_state.prop_master.get(active_prop, "default_local_zip")
-
-with head_col2:
-    with st.popover("⚙️ Property Settings"):
-        st.subheader("Add New Property")
-        new_p_name = st.text_input("Property Name", key="new_name")
-        new_p_zip = st.text_input("Property Zip Code", key="new_zip")
-        if st.button("➕ Create"):
-            if new_p_name and new_p_zip:
-                st.session_state.prop_master[new_p_name] = new_p_zip
-                save_properties_master(st.session_state.prop_master)
-                st.rerun()
-        
-        st.divider()
-        st.subheader("Update Current Zip")
-        current_zip_edit = st.text_input(f"Edit Zip for {active_prop}", value=active_zip)
-        if st.button("💾 Update Zip"):
-            st.session_state.prop_master[active_prop] = current_zip_edit
-            save_properties_master(st.session_state.prop_master)
-            st.rerun()
-        
-        st.divider()
-        if st.button(f"💥 Delete {active_prop} Zones", type="primary"):
-            # Wipe all data rows matching this specific property name from the server instantly
+# 0.2 User DB Authentication Helpers
+def db_register_user(username, password):
+    username_lower = username.strip().lower()
+    hashed = data_manager.hash_password(password)
+    # Check if database is mock or real
+    if not isinstance(conn, MockConnection) and hasattr(conn, "session"):
+        try:
             with conn.session as session:
+                res = session.execute(
+                    text("SELECT 1 FROM app_users WHERE username = :user"),
+                    {"user": username_lower}
+                ).fetchone()
+                if res:
+                    return False
                 session.execute(
-                    text("DELETE FROM zone_profiles WHERE property = :prop"), 
-                    {"prop": active_prop}
-                )
-                session.execute(
-                    text("DELETE FROM watering_logs WHERE property = :prop"), 
-                    {"prop": active_prop}
+                    text("INSERT INTO app_users (username, password_hash) VALUES (:user, :hash)"),
+                    {"user": username_lower, "hash": hashed}
                 )
                 session.commit()
-            
-            st.cache_data.clear()
-            st.warning(f"All database rows for {active_prop} completely wiped.")
-            st.rerun()
-                             
+                return True
+        except Exception:
+            pass
+    # Fallback to local files
+    return data_manager.register_user_local(username, password)
+
+def db_authenticate_user(username, password):
+    username_lower = username.strip().lower()
+    if not isinstance(conn, MockConnection) and hasattr(conn, "session"):
+        try:
+            with conn.session as session:
+                res = session.execute(
+                    text("SELECT password_hash FROM app_users WHERE username = :user"),
+                    {"user": username_lower}
+                ).fetchone()
+                if not res:
+                    return False
+                stored_hash = res[0]
+                return data_manager.verify_password(password, stored_hash)
+        except Exception:
+            pass
+    # Fallback to local files
+    return data_manager.authenticate_user_local(username, password)
+
+# ==============================================================================
+# USER LOGIN / REGISTRATION FLOW
+# ==============================================================================
+
+def load_properties_from_cloud():
+    """Loads a user's property list from the shared Postgres/Supabase cloud table if available."""
+    if isinstance(conn, MockConnection):
+        return None
+    try:
+        df = conn.query(
+            "SELECT property_name, zip_code FROM properties WHERE user_id = :user_id",
+            params={"user_id": st.session_state.user_id},
+            ttl=0,
+        )
+        if not df.empty:
+            return df.set_index("property_name")["zip_code"].to_dict()
+    except Exception:
+        return None
+    return None
 
 
-## --- FILE PATHS & CLOUD DATABASE CONFIG ---
-# WEATHER moves to the "Do Not Delete" folder
-WEATHER_LOG = os.path.join(SYSTEM_DIR, f"{active_prop}_weather.json")
+def save_property_to_cloud(prop_name, zip_code):
+    """Stores a user's property in the shared cloud table when the SQL connection is available."""
+    if isinstance(conn, MockConnection):
+        return
+    try:
+        with conn.session as session:
+            session.execute(text("""
+                INSERT INTO properties (user_id, property_name, zip_code)
+                VALUES (:user_id, :prop_name, :zip_code)
+                ON CONFLICT (user_id, property_name)
+                DO UPDATE SET zip_code = EXCLUDED.zip_code;
+            """), {
+                "user_id": st.session_state.user_id,
+                "prop_name": prop_name,
+                "zip_code": zip_code,
+            })
+            session.commit()
+    except Exception:
+        pass
 
-# --- CLOUD DATABASE FUNCTIONS (No local files needed) ---
 
-def load_profiles():
-    # Fetch all zone settings from the offsite database for the active property
-    query = "SELECT zone_name, area, flow, soil, depth, mad FROM zone_profiles WHERE property = :prop"
-    df = conn.query(query, params={"prop": active_prop}, ttl=0)
-    
-    if df.empty:
-        # Pre-make the 12 default zones on the cloud if it's a brand new property profile
-        default_twelve_zones = {}
-        for i in range(1, 13):
-            default_twelve_zones[f"Zone {i}"] = {
-                "area": 2000, "flow": 20, "soil": "Loam", "depth": 12, "mad": 50
-            }
-        return default_twelve_zones
-        
-    # Convert database rows smoothly back into your standard dictionary format
-    return df.set_index("zone_name").to_dict(orient="index")
-
-from sqlalchemy import text  # Ensure text is imported to format the raw query safely
-def save_profiles(p):
-    # Upsert (Insert or update if already existing) the active zone data rows on the server
-    with conn.session as session:
-        for zone_name, specs in p.items():
-            session.execute(
-                text("""
-                INSERT INTO zone_profiles (property, zone_name, area, flow, soil, depth, mad)
-                VALUES (:prop, :zone, :area, :flow, :soil, :depth, :mad)
-                ON CONFLICT (property, zone_name) 
-                DO UPDATE SET area = EXCLUDED.area, flow = EXCLUDED.flow, soil = EXCLUDED.soil, depth = EXCLUDED.depth, mad = EXCLUDED.mad;
-                """),
-                {
-                    "prop": active_prop, "zone": zone_name, 
-                    "area": int(specs["area"]), "flow": int(specs["flow"]), 
-                    "soil": specs["soil"], "depth": int(specs["depth"]), "mad": int(specs["mad"])
+def load_profiles_from_cloud(active_property):
+    """Loads a user's zone profiles from the shared Postgres/Supabase cloud table if available."""
+    if isinstance(conn, MockConnection):
+        return None
+    try:
+        df = conn.query(
+            """
+                SELECT zone_name, area, flow, soil, depth, mad, start_date
+                FROM zones
+                WHERE user_id = :user_id AND property_name = :property_name
+            """,
+            params={"user_id": st.session_state.user_id, "property_name": active_property},
+            ttl=0,
+        )
+        if not df.empty:
+            zone_dict = {}
+            for _, row in df.iterrows():
+                zone_dict[row["zone_name"]] = {
+                    "zip": active_zip,
+                    "area": int(row["area"]),
+                    "flow": float(row["flow"]),
+                    "soil": row["soil"],
+                    "depth": int(row["depth"]),
+                    "mad": int(row["mad"]),
+                    "start_date": str(row["start_date"]),
                 }
-            )
-        session.commit()
-    # Force Streamlit to instantly request the updated rows on reload
-    st.cache_data.clear()
+            return zone_dict
+    except Exception:
+        return None
+    return None
 
 
-def load_logs():
-    # Pull water history matching this property
-    query = "SELECT zone_name, log_date, minutes, inches FROM watering_logs WHERE property = :prop"
-    df = conn.query(query, params={"prop": active_prop}, ttl=0)
+def save_profiles_to_cloud(profiles_dict, active_property):
+    """Stores the current zone profile set under the shared cloud table, scoped to the user and property."""
+    if isinstance(conn, MockConnection):
+        return
+    try:
+        with conn.session as session:
+            for zone_name, config in profiles_dict.items():
+                session.execute(text("""
+                    INSERT INTO zones (
+                        user_id, property_name, zone_name, area, flow, soil, depth, mad, start_date
+                    )
+                    VALUES (
+                        :user_id, :property_name, :zone_name, :area, :flow, :soil, :depth, :mad, :start_date
+                    )
+                    ON CONFLICT (user_id, property_name, zone_name)
+                    DO UPDATE SET
+                        area = EXCLUDED.area,
+                        flow = EXCLUDED.flow,
+                        soil = EXCLUDED.soil,
+                        depth = EXCLUDED.depth,
+                        mad = EXCLUDED.mad,
+                        start_date = EXCLUDED.start_date;
+                """), {
+                    "user_id": st.session_state.user_id,
+                    "property_name": active_property,
+                    "zone_name": zone_name,
+                    "area": int(config.get("area", 1000)),
+                    "flow": float(config.get("flow", 5)),
+                    "soil": config.get("soil", "Loam"),
+                    "depth": int(config.get("depth", 12)),
+                    "mad": int(config.get("mad", 50)),
+                    "start_date": config.get("start_date", str(datetime.now().date())),
+                })
+            session.commit()
+    except Exception:
+        pass
+
+
+def load_logs_from_cloud(active_property):
+    """Loads watering history for the current user/property from the shared cloud table when available."""
+    if isinstance(conn, MockConnection):
+        return None
+    try:
+        df = conn.query(
+            """
+                SELECT zone_name, log_date, minutes, inches
+                FROM watering_logs
+                WHERE user_id = :user_id AND property_name = :property_name
+            """,
+            params={"user_id": st.session_state.user_id, "property_name": active_property},
+            ttl=0,
+        )
+        if not df.empty:
+            return df
+    except Exception:
+        return None
+    return None
+
+
+def save_log_to_cloud(zone_name, minutes, inches_applied, active_property):
+    """Mirrors a watering event into the shared cloud table when the SQL connection is available."""
+    if isinstance(conn, MockConnection):
+        return
+    try:
+        with conn.session as session:
+            session.execute(text("""
+                INSERT INTO watering_logs (user_id, property_name, zone_name, log_date, minutes, inches)
+                VALUES (:user_id, :property_name, :zone_name, :log_date, :minutes, :inches);
+            """), {
+                "user_id": st.session_state.user_id,
+                "property_name": active_property,
+                "zone_name": zone_name,
+                "log_date": datetime.now().date(),
+                "minutes": float(minutes),
+                "inches": float(inches_applied),
+            })
+            session.commit()
+    except Exception:
+        pass
+
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🌱 Irrigation Dashboard Login")
+    st.markdown("Welcome! Please log in or sign up to manage your properties and zone configurations.")
+
+    tab_login, tab_signup = st.tabs(["🔒 Login", "📝 Sign Up"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username").strip()
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Log In", use_container_width=True)
+            if submitted:
+                if username and password:
+                    if db_authenticate_user(username, password):
+                        st.session_state.authenticated = True
+                        st.session_state.username = username
+                        st.session_state.user_id = username
+                        st.success(f"Welcome back, {username}!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
+                else:
+                    st.warning("Please fill in all fields.")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            new_username = st.text_input("Choose Username", key="signup_username").strip()
+            new_password = st.text_input("Choose Password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm_password")
+            submitted = st.form_submit_button("Create Account", use_container_width=True)
+            if submitted:
+                if new_username and new_password:
+                    if len(new_username) < 3:
+                        st.error("Username must be at least 3 characters.")
+                    elif new_password != confirm_password:
+                        st.error("Passwords do not match.")
+                    elif len(new_password) < 6:
+                        st.error("Password must be at least 6 characters.")
+                    else:
+                        if db_register_user(new_username, new_password):
+                            st.success("Account created successfully! You can now log in.")
+                        else:
+                            st.error("Username is already taken.")
+                else:
+                    st.warning("Please fill in all fields.")
+    st.stop()
+
+# ==============================================================================
+# PROPERTY CONFIGURATION & SESSION STATE (Authenticated User)
+# ==============================================================================
+user_paths = data_manager.get_user_paths(st.session_state.user_id)
+PROP_LIST_FILE = user_paths["prop_list"]
+
+properties_dict = load_properties_from_cloud() or data_manager.load_json(PROP_LIST_FILE, {})
+
+# Render Property Selector in Sidebar
+st.sidebar.header("🏠 Property Settings")
+prop_options = list(properties_dict.keys())
+
+# If the user has no properties, force them to create one
+if not prop_options:
+    st.sidebar.info("👋 Welcome! Create your first property to get started.")
+    new_prop_name = st.sidebar.text_input("Property Name (e.g., Home)", key="first_prop_name")
+    new_prop_zip = st.sidebar.text_input("Zip Code", key="first_prop_zip")
+    if st.sidebar.button("Create Property", use_container_width=True):
+        if new_prop_name.strip() and new_prop_zip.strip():
+            p_name = new_prop_name.strip()
+            p_zip = new_prop_zip.strip()
+            properties_dict[p_name] = p_zip
+            data_manager.save_json(PROP_LIST_FILE, properties_dict)
+            save_property_to_cloud(p_name, p_zip)
+            st.session_state.active_prop = p_name
+            st.toast(f"🏡 Property '{p_name}' created!")
+            st.rerun()
+        else:
+            st.sidebar.error("Please enter a valid name and zip code.")
     
+    st.sidebar.divider()
+    if st.sidebar.button("🚪 Log Out", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.session_state.user_id = "default_user"
+        st.session_state.active_prop = None
+        st.rerun()
+    st.stop()
+
+if "active_prop" not in st.session_state or st.session_state.active_prop not in prop_options:
+    st.session_state.active_prop = prop_options[0]
+
+active_prop = st.sidebar.selectbox("Select Active Property", prop_options, index=prop_options.index(st.session_state.active_prop))
+st.session_state.active_prop = active_prop
+active_zip = properties_dict[active_prop]
+
+# Expandable area to add a new property
+with st.sidebar.expander("➕ Add New Property"):
+    new_prop_name = st.text_input("Property Name", key="new_prop_name_input")
+    new_prop_zip = st.text_input("Zip Code", key="new_prop_zip_input")
+    if st.button("Save Property", use_container_width=True):
+        if new_prop_name.strip() and new_prop_zip.strip():
+            p_name = new_prop_name.strip()
+            p_zip = new_prop_zip.strip()
+            if p_name not in properties_dict:
+                properties_dict[p_name] = p_zip
+                data_manager.save_json(PROP_LIST_FILE, properties_dict)
+                save_property_to_cloud(p_name, p_zip)
+                st.session_state.active_prop = p_name
+                st.toast(f"🏡 Property '{p_name}' added!")
+                st.rerun()
+            else:
+                st.error("A property with that name already exists.")
+
+# Logout button
+if st.sidebar.button("🚪 Log Out", use_container_width=True):
+    st.session_state.authenticated = False
+    st.session_state.username = None
+    st.session_state.user_id = "default_user"
+    st.session_state.active_prop = None
+    st.rerun()
+
+# Dynamic path resolution based on active property and user
+paths = data_manager.get_prop_paths_for_user(st.session_state.user_id, active_prop)
+PROFILE_FILE = paths["db"]
+LOG_FILE = paths["log"]
+WEATHER_LOG = paths["weather"]
+DATA_DIR = data_manager.DATA_DIR
+BACKUP_DIR = data_manager.BACKUP_DIR
+
+
+def load_profiles_from_supabase():
+    """Loads zone profiles from the verified live Supabase/Postgres SQL connection if available."""
+    if isinstance(conn, MockConnection) or not hasattr(conn, "query"):
+        return None
+    if not active_prop:
+        return None
+    try:
+        df = conn.query(
+            """
+                SELECT zone_name, area, flow, soil, depth, mad, start_date
+                FROM zones
+                WHERE user_id = :user_id
+                  AND property_name = :property_name
+            """,
+            params={"user_id": st.session_state.user_id, "property_name": active_prop},
+            ttl=0,
+        )
+        if df.empty:
+            return None
+
+        profiles_from_cloud = {}
+        for _, row in df.iterrows():
+            zone_name = row.get("zone_name")
+            if zone_name:
+                profiles_from_cloud[zone_name] = {
+                    "zip": active_zip,
+                    "area": int(row.get("area", 1000)),
+                    "flow": float(row.get("flow", 5)),
+                    "soil": row.get("soil", "Loam"),
+                    "depth": int(row.get("depth", 12)),
+                    "mad": int(row.get("mad", 50)),
+                    "start_date": str(row.get("start_date", str(datetime.now().date()))),
+                }
+        return profiles_from_cloud if profiles_from_cloud else None
+    except Exception:
+        return None
+
+
+def save_profiles_to_supabase(profiles_dict):
+    """Best-effort mirror of zone profiles to the live SQL connection used by Supabase."""
+    if isinstance(conn, MockConnection) or not hasattr(conn, "session"):
+        return
+    try:
+        with conn.session as session:
+            for zone_name, config in profiles_dict.items():
+                session.execute(text("""
+                    INSERT INTO zones (
+                        user_id, property_name, zone_name, area, flow, soil, depth, mad, start_date
+                    )
+                    VALUES (
+                        :user_id, :property_name, :zone_name, :area, :flow, :soil, :depth, :mad, :start_date
+                    )
+                    ON CONFLICT (user_id, property_name, zone_name)
+                    DO UPDATE SET
+                        area = EXCLUDED.area,
+                        flow = EXCLUDED.flow,
+                        soil = EXCLUDED.soil,
+                        depth = EXCLUDED.depth,
+                        mad = EXCLUDED.mad,
+                        start_date = EXCLUDED.start_date;
+                """), {
+                    "user_id": st.session_state.user_id,
+                    "property_name": active_prop,
+                    "zone_name": zone_name,
+                    "area": int(config.get("area", 1000)),
+                    "flow": float(config.get("flow", 5)),
+                    "soil": config.get("soil", "Loam"),
+                    "depth": int(config.get("depth", 12)),
+                    "mad": int(config.get("mad", 50)),
+                    "start_date": config.get("start_date", str(datetime.now().date())),
+                })
+            session.commit()
+    except Exception:
+        pass
+
+
+# 0.4 Helper: Local Zone Profiles I/O using data_manager
+def load_profiles():
+    """Loads configured zone settings from Supabase when available, otherwise local JSON fallback."""
+    default_profile = {
+        "Front Lawn": {
+            "zip": active_zip,
+            "area": 1200,
+            "flow": 8.0,
+            "soil": "Loam",
+            "depth": 6,
+            "mad": 50,
+            "start_date": str(datetime.now().date() - pd.Timedelta(days=7))
+        }
+    }
+    cloud_profiles = load_profiles_from_supabase()
+    if cloud_profiles is not None:
+        return cloud_profiles
+    return data_manager.load_json(PROFILE_FILE, default_profile)
+
+def save_profiles(profiles_dict):
+    """Saves structural zone configurations to local JSON and mirrors to Supabase if configured."""
+    data_manager.save_json(PROFILE_FILE, profiles_dict)
+    save_profiles_to_supabase(profiles_dict)
+
+
+# ==============================================================================
+# 1. DATABASE & STORAGE UTILITIES
+# ==============================================================================
+
+# 1.1 Load Zone Logs from Database
+def load_logs():
+    """Pulls watering history matching this property and active user from shared cloud storage when available."""
+    cloud_df = load_logs_from_cloud(active_prop)
+    if cloud_df is not None and not cloud_df.empty:
+        df = cloud_df
+    else:
+        query = """
+            SELECT zone_name, log_date, minutes, inches 
+            FROM watering_logs 
+            WHERE property_name = :prop AND user_id = :user_id
+        """
+        try:
+            df = conn.query(query, params={"prop": active_prop, "user_id": st.session_state.user_id}, ttl=0)
+        except Exception:
+            df = pd.DataFrame()
+        
+        # Local JSON Backup Fallback if Database isn't reachable
+        if df.empty:
+            local_data = data_manager.load_json(LOG_FILE, {})
+            combined_list = []
+            for z, events in local_data.items():
+                for ev in events:
+                    combined_list.append({
+                        "zone_name": z,
+                        "log_date": ev["date"],
+                        "minutes": ev["minutes"],
+                        "inches": ev["inches"]
+                    })
+            df = pd.DataFrame(combined_list)
+
     logs = {}
     if not df.empty:
         for _, row in df.iterrows():
             z = row['zone_name']
-            if z not in logs: logs[z] = []
-            logs[z].append({"date": str(row['log_date']), "minutes": row['minutes'], "inches": row['inches']})
+            if z not in logs: 
+                logs[z] = []
+            logs[z].append({
+                "date": str(row['log_date']), 
+                "minutes": row['minutes'], 
+                "inches": row['inches']
+            })
     return logs
 
 
+# 1.2 Save Local Log to Database & JSON Backup
 def save_log(zone, minutes, inches_applied):
-    # Log a fresh irrigation event straight to the cloud tables
-    with conn.session as session:
-        query = text("""
-            INSERT INTO watering_logs (property, zone_name, log_date, minutes, inches)
-            VALUES (:prop, :zone, :date, :mins, :inches);
-        """)
-        
-        session.execute(
-            query,
-            {
-                "prop": active_prop,
-                "zone": zone,
-                "date": datetime.now().date(),
-                "mins": float(minutes),
-                "inches": float(inches_applied)
-            }
-        )
-        session.commit()
+    """Inserts a verified watering event into the shared cloud table when available and mirrors to local backup."""
+    # Step A: Push to SQL Connection if online
+    try:
+        with conn.session as session:
+            query = text("""
+                INSERT INTO watering_logs (user_id, property_name, zone_name, log_date, minutes, inches)
+                VALUES (:user_id, :prop, :zone, :date, :mins, :inches);
+            """)
+            session.execute(
+                query,
+                {
+                    "user_id": st.session_state.user_id,
+                    "prop": active_prop,
+                    "zone": zone,
+                    "date": datetime.now().date(),
+                    "mins": float(minutes),
+                    "inches": float(inches_applied)
+                }
+            )
+            session.commit()
+    except Exception:
+        pass
+
+    save_log_to_cloud(zone, minutes, inches_applied, active_prop)
+
+    # Step B: Mirror to local backup JSON
+    local_logs = data_manager.load_json(LOG_FILE, {})
+    if zone not in local_logs:
+        local_logs[zone] = []
+    local_logs[zone].append({
+        "date": str(datetime.now().date()),
+        "minutes": float(minutes),
+        "inches": float(inches_applied)
+    })
+    data_manager.save_json(LOG_FILE, local_logs)
+
     st.cache_data.clear()
 
 
+# 1.3 Archive Weather to Local Storage Cache
 def archive_weather(df_daily):
-    history = {}
-    if not os.path.exists(WEATHER_LOG):
-        with open(WEATHER_LOG, "w") as f:
-            json.dump({}, f)
-    if os.path.exists(WEATHER_LOG):
-        with open(WEATHER_LOG, "r") as f: history = json.load(f)
+    """Stores historical daily ET and Rainfall records in a local JSON structure."""
+    history = data_manager.load_json(WEATHER_LOG, {})
     for _, row in df_daily.iterrows():
         date_str = row['time'].strftime('%Y-%m-%d')
         if row['time'].date() <= datetime.now().date():
             history[date_str] = {"ET0 (in)": row["ET0 (in)"], "Rain (in)": row["Rain (in)"]}
-    with open(WEATHER_LOG, "w") as f: json.dump(history, f)
+    data_manager.save_json(WEATHER_LOG, history)
 
 
+# 1.4 Load Archived Weather History
 def load_weather_history():
-    if os.path.exists(WEATHER_LOG):
-        with open(WEATHER_LOG, "r") as f:
-            data = json.load(f)
-            df = pd.DataFrame.from_dict(data, orient='index').reset_index()
-            df.columns = ['time', 'ET0 (in)', 'Rain (in)']
-            df['time'] = pd.to_datetime(df['time'])
-            return df
+    """Loads archived local weather logs and transforms into a DataFrame."""
+    data = data_manager.load_json(WEATHER_LOG, {})
+    if data:
+        # Exclude reserved metadata keys (e.g. rate-limit timestamp)
+        weather_data = {k: v for k, v in data.items() if not k.startswith("__")}
+        if not weather_data:
+            return pd.DataFrame(columns=['time', 'ET0 (in)', 'Rain (in)'])
+        df = pd.DataFrame.from_dict(weather_data, orient='index').reset_index()
+        df.columns = ['time', 'ET0 (in)', 'Rain (in)']
+        df['time'] = pd.to_datetime(df['time'])
+        return df
     return pd.DataFrame(columns=['time', 'ET0 (in)', 'Rain (in)'])
 
 
-# --- INITIAL DATA INITIALIZATION RUN ---
+# ==============================================================================
+# 2. APPLICATION INITIALIZATION
+# ==============================================================================
+
+mode_label = "☁️ Cloud sync active" if SUPABASE_READY else "💾 Local-only mode"
+st.markdown(
+    f"<div style='padding:8px 12px; background:#f0f2f6; border-radius:8px; margin-bottom:12px;'>"
+    f"<strong>Irrigation Dashboard</strong> — <span>{mode_label}</span> — <em>v0.35</em></div>",
+    unsafe_allow_html=True,
+)
+
+# 2.1 Load Local App Profiles
 profiles = load_profiles()
 
-#### 4. ZONE SELECTION & MANAGEMENT
+
+# ==============================================================================
+# 3. ZONE SELECTION & MANAGEMENT
+# ==============================================================================
 st.sidebar.header(f"📍 {active_prop} Zones")
 
-# 1. Extract the current zones from profiles
+# Extract the current active zones
 zone_list = list(profiles.keys())
 
+# 3.1 Fallback: Create Default Zone if empty
 if not zone_list:
     st.sidebar.warning("No zones found for this property.")
     if st.sidebar.button("➕ Initialize Default Zone 1", use_container_width=True):
@@ -230,29 +676,46 @@ if not zone_list:
             "flow": 5,
             "soil": "Loam",
             "depth": 6,
-            "mad": 50
+            "mad": 50,
+            "start_date": str(datetime.now().date())
         }
         save_profiles(profiles)
         st.rerun()
     st.stop()
 
-# Define Callbacks for "Hit Enter to Save" automation
+
+# 3.2 Action Callback: Rename Active Zone
 def handle_rename_submit():
     new_name = st.session_state.rename_input.strip()
     if new_name and new_name != active_zone_name:
         profiles[new_name] = profiles.pop(active_zone_name)
         
-        # Sync the local historical logs with the new name change
-        logs = load_logs()
-        if active_zone_name in logs:
-            logs[new_name] = logs.pop(active_zone_name)
-            with open(LOG_FILE, "w") as f: 
-                json.dump(logs, f)
+        # Sync naming modification inside PostgreSQL logs
+        try:
+            with conn.session as session:
+                session.execute(
+                    text("""
+                        UPDATE watering_logs 
+                        SET zone_name = :new_name 
+                        WHERE property = :prop AND zone_name = :old_name AND user_id = :user_id
+                    """),
+                    {
+                        "new_name": new_name, 
+                        "old_name": active_zone_name, 
+                        "prop": active_prop, 
+                        "user_id": st.session_state.user_id
+                    }
+                )
+                session.commit()
+        except Exception:
+            pass
         
         save_profiles(profiles)
         st.toast(f"✏️ Renamed to {new_name}!")
         st.rerun()
 
+
+# 3.3 Action Callback: Add New Custom Zone
 def handle_add_submit():
     custom_new_zone = st.session_state.add_input.strip()
     if custom_new_zone and custom_new_zone not in profiles:
@@ -262,17 +725,18 @@ def handle_add_submit():
             "flow": 5,
             "soil": "Loam",
             "depth": 12,
-            "mad": 50
+            "mad": 50,
+            "start_date": str(datetime.now().date())
         }
         save_profiles(profiles)
         st.toast(f"🌱 {custom_new_zone} added successfully!")
         st.rerun()
 
-# Create layout inside the sidebar for the selection widget and option settings
+
+# 3.4 Display Zone Selection UI Columns
 zone_col1, zone_col2 = st.sidebar.columns([3, 1]) 
 
 with zone_col1:
-    # Main Dropdown Menu: Dynamically scales based on the current size of zone_list
     active_zone_name = st.selectbox("Select Active Zone", zone_list, label_visibility="visible")
     current_zone = profiles[active_zone_name]
 
@@ -280,7 +744,7 @@ with zone_col2:
     st.write(" ")
     st.write(" ")
     with st.popover("⚙️"):
-        # SECTION A: RENAME ZONE (Hit Enter to Save)
+        # SECTION A: RENAME ZONE
         st.subheader("📝 Rename This Zone")
         st.text_input(
             "New Name", 
@@ -291,7 +755,7 @@ with zone_col2:
         
         st.divider()
         
-        # SECTION B: ADD EXTRA ZONE (Hit Enter to Save)
+        # SECTION B: ADD EXTRA ZONE
         st.subheader("➕ Add Extra Zone")
         st.text_input(
             "Zone Name", 
@@ -303,51 +767,47 @@ with zone_col2:
 
         st.divider()
         
-        # SECTION C: REMOVE ACTIVE ZONE (Moved inside settings menu)
+        # SECTION C: REMOVE ACTIVE ZONE
         st.subheader("🗑️ Remove This Zone")
         st.markdown(f"Wipe profile configuration and structural metrics for **{active_zone_name}**.")
         if st.button(f"Delete {active_zone_name}", type="primary", use_container_width=True):
-            with conn.session as session:
-                session.execute(
-                    text("DELETE FROM zone_profiles WHERE property = :prop AND zone_name = :zone"),
-                    {"prop": active_prop, "zone": active_zone_name}
-                )
-                session.execute(
-                    text("DELETE FROM watering_logs WHERE property = :prop AND zone_name = :zone"),
-                    {"prop": active_prop, "zone": active_zone_name}
-                )
-                session.commit()
+            try:
+                with conn.session as session:
+                    session.execute(
+                        text("DELETE FROM zones WHERE property_name = :prop AND zone_name = :zone AND user_id = :user_id"),
+                        {"prop": active_prop, "zone": active_zone_name, "user_id": st.session_state.user_id}
+                    )
+                    session.execute(
+                        text("DELETE FROM watering_logs WHERE property_name = :prop AND zone_name = :zone AND user_id = :user_id"),
+                        {"prop": active_prop, "zone": active_zone_name, "user_id": st.session_state.user_id}
+                    )
+                    session.commit()
+            except Exception:
+                pass
                 
             if active_zone_name in profiles:
                 profiles.pop(active_zone_name)
-                save_profiles(profiles)
-            
-            logs = load_logs()
-            if active_zone_name in logs:
-                logs.pop(active_zone_name)
-                with open(LOG_FILE, "w") as f:
-                    json.dump(logs, f)
             
             save_profiles(profiles)
             st.cache_data.clear()
             st.toast(f"💥 Wiped {active_zone_name} from dashboard configuration profile.")
             st.rerun()
 
+
+# 3.5 Geolocation Cache Utility
 @st.cache_data(ttl=3600)
-def get_coords(zip_code):
-    try:
-        res = requests.get(f"http://api.zippopotam.us/us/{zip_code}", timeout=5).json()
-        return float(res['places'][0]['latitude']), float(res['places'][0]['longitude']), f"{res['places'][0]['place name']}"
-    except: 
-        return 42.9286, -84.7981, "Westphalia, MI"
+def get_coords_cached(zip_code):
+    lat, lon, name = core_logic.get_coords(zip_code)
+    return lat, lon
 
-lat, lon, z_name = get_coords(active_zip)
+lat, lon = get_coords_cached(active_zip)
 
-# --- IRRIGATION SPECIFICATIONS ---
-# --- IRRIGATION SPECIFICATIONS (AUTO-SAVING) ---
+
+# ==============================================================================
+# 4. IRRIGATION SPECIFICATIONS (AUTO-SAVING INPUTS)
+# ==============================================================================
 st.sidebar.header("💧 Irrigation Specs")
 
-# 1. Grab values, falling back to clean defaults if they don't exist yet
 current_area = int(current_zone.get("area", 1000))
 current_flow = int(current_zone.get("flow", 5))
 saved_soil = current_zone.get("soil", "Loam")
@@ -355,45 +815,41 @@ current_depth = int(current_zone.get("depth", 12))
 current_mad = int(current_zone.get("mad", 50))
 current_start_dt = current_zone.get("start_date", str(datetime.now().date()))
 
-# 2. Render UI widgets. Any user interaction instantly updates the variable.
+# Render UI Controls
 area = st.sidebar.number_input("Zone Area (sq ft)", min_value=1, value=current_area, step=1, format="%d")
 flow = st.sidebar.number_input("Zone Flow (GPM)", min_value=1, value=current_flow, step=1, format="%d")
 
-soil_types = list(SOIL_DATA.keys())
+soil_types = list(core_logic.SOIL_DATA.keys())
 try:
     soil_index = soil_types.index(saved_soil)
 except ValueError:
     soil_index = soil_types.index("Loam")
 soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
 
+
 depth_in = st.sidebar.slider(
     "Root Depth (in)", 
     min_value=1,   
     max_value=24,  
-    value=6, 
-    help="The target active root depth profile. Deeper roots have access to a larger structural water reservoir, requiring less frequent but longer watering cycles."
+    value=current_depth, 
+    help="The target active root depth profile. Deeper roots have access to a larger structural water reservoir."
 )
 mad = st.sidebar.slider(
     "Manageable Allowable Depletion (MAD %)",
     min_value=10,
     max_value=80,
-    value=50,
+    value=current_mad,
     step=5,
-    help="""Manageable Allowable Depletion. The percentage of the soil's water storage capacity allowed to dry out before triggering the next irrigation cycle."
-    * **Lower % (e.g., 30-40%):** Kept wetter. Best for sensitive, shallow-rooted plants or high-stress periods.
-    * **Standard (50%):** The industry baseline. Maximizes root health and water efficiency without stressing the crop.
-    * **Higher % (e.g., 60-70%):** Kept drier. Used for drought-tolerant species or to encourage deep root growth.
-"""
+    help="The percentage of soil water allowed to dry out before triggering an irrigation cycle."
 )
 
-# 3. AUTO-SAVE CHECK: Compare current inputs against what is saved in the file
+# Auto-Save Engine: Updates automatically if any parameter is altered
 if (area != current_area or 
     flow != current_flow or 
     soil_choice != saved_soil or 
     depth_in != current_depth or 
     mad != current_mad):
     
-    # Pack the fresh entries up
     profiles[active_zone_name] = {
         "zip": active_zip,
         "area": area, 
@@ -404,70 +860,56 @@ if (area != current_area or
         "start_date": current_start_dt  
     }
     
-    # Quietly drop the placeholder if they edited the default settings
     if active_zone_name != "Default Zone" and "Default Zone" in profiles:
         del profiles["Default Zone"]
         
     save_profiles(profiles)
-    st.rerun() # Refresh layout instantly to update downstream ET calculations
-
+    st.rerun()
     
 st.sidebar.divider()
 
-# --- WATER LOGGING MANAGEMENT ---
+
+# ==============================================================================
+# 5. WATER LOGGING MANAGEMENT
+# ==============================================================================
 st.sidebar.header("📝 Log a Watering Event")
 
+# 5.1 Callback for Runtime Logger
 def handle_quick_submit():
-    # Only execute if the user actually ran the system for more than 0 minutes
     if st.session_state.quick_mins > 0:
-        # 1. Grab the active zone configuration numbers from the current dashboard state
-        # (Make sure these match the exact variable names used in your Section 8 calculation)
-        try:
-            flow_val = float(active_flow)
-            area_val = float(active_area)
-        except (NameError, TypeError, ValueError):
-            # Fallback values if variables aren't globally accessible inside the sidebar function
-            flow_val = 10.0
-            area_val = 500.0
+        flow_val = float(flow)
+        area_val = float(area)
 
-        # 2. Calculate the real-time Precipitation Rate using the standard formula
+        # Apply precipitation rate formulas
         if area_val > 0:
             rate = (flow_val * 96.25) / area_val
         else:
-            rate = 0.5  # Engineering default fallback if area is 0
+            rate = 0.5 
         
-        # 3. Compute precisely how much depth was applied 
         calc_inches = (st.session_state.quick_mins / 60.0) * rate
-        
-        # 4. Save to Supabase instantly using your schema-corrected function
         save_log(active_zone_name, st.session_state.quick_mins, calc_inches)
         
-        # 5. Notify user with a toast popup banner
         st.toast(f"🌱 Logged {st.session_state.quick_mins} mins to {active_zone_name} history!")
-        
-        # Reset the input box back to 0 so it doesn't double-trigger on the next click
         st.session_state.quick_mins = 0.0
 
-# Ensure your soil selectbox has a key="soil_type" matching the state lookup above!
+# 5.2 Render Runtime Input
 st.sidebar.number_input(
     label="⏱️ Enter Runtime Minutes & Hit Enter:",
     min_value=0.0,
     max_value=240.0,
     value=0.0,
     step=1.0,
-    key="quick_mins",              # Ties the value directly to session memory
-    on_change=handle_quick_submit  # Executes the save function the moment they press Enter
+    key="quick_mins",
+    on_change=handle_quick_submit
 )
 
 
+# ==============================================================================
+# 6. MATH ENGINE (PHYSICAL PROPERTY EXTRACTION)
+# ==============================================================================
+aw_per_foot, paw_total, ad_limit = core_logic.calculate_irrigation_limits(soil_choice, depth_in, mad)
 
-
-#### 5. MATH ENGINE 
-# Call your new math engine
-aw_per_foot, paw_total, ad_limit = calculate_irrigation_limits(soil_choice, depth_in, mad)
-
-# 2. Grab the raw constants for the audit display (converted to inches/foot)
-soil_info = SOIL_DATA.get(soil_choice, SOIL_DATA["Loam"])
+soil_info = core_logic.SOIL_DATA.get(soil_choice, core_logic.SOIL_DATA["Loam"])
 fc_raw = soil_info["FC"]
 pwp_raw = soil_info["PWP"]
 fc_inft = fc_raw * 12
@@ -477,21 +919,50 @@ aw_capacity_inft = (fc_raw - pwp_raw) * 12
 
 
 
+# ==============================================================================
+# 7. WEATHER ENGINE (API & DATA SYNCHRONIZATION)
+# ==============================================================================
 
-#### 6. WEATHER ENGINE (Integrated Open-Meteo Library)
-
-# 6.1 Setup the Open-Meteo API client with cache
-cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+# 7.1 Setup API Sessions
+cache_session = requests_cache.CachedSession('.cache', expire_after=300)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
 
-@st.cache_data(ttl=3600)
-def fetch_weather_integrated(lat, lon, start_date_str):
+
+# 7.2 Core Integrated Fetching Routine
+# Rate-limit key stored inside the weather JSON under a reserved "__last_fetch__" key.
+API_COOLDOWN_SECONDS = 300  # 5 minutes
+
+def _is_api_cooldown_active(weather_log_path):
+    """Returns True if the last successful API call was less than API_COOLDOWN_SECONDS ago."""
+    meta = data_manager.load_json(weather_log_path, {})
+    last_fetch_str = meta.get("__last_fetch__")
+    if last_fetch_str:
+        try:
+            last_fetch = datetime.fromisoformat(last_fetch_str)
+            elapsed = (datetime.now() - last_fetch).total_seconds()
+            return elapsed < API_COOLDOWN_SECONDS
+        except Exception:
+            pass
+    return False
+
+def _record_api_fetch(weather_log_path):
+    """Stamps the current timestamp into the weather JSON so cooldown persists across restarts."""
+    meta = data_manager.load_json(weather_log_path, {})
+    meta["__last_fetch__"] = datetime.now().isoformat()
+    data_manager.save_json(weather_log_path, meta)
+
+@st.cache_data(ttl=300)
+def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
+    # --- Persistent rate-limit guard ---
+    if _is_api_cooldown_active(weather_log_path):
+        # Return None so the caller falls back to locally archived data
+        return None
+
     start_dt = pd.to_datetime(start_date_str).date()
     today = datetime.now().date()
     days_back = (today - start_dt).days
     
-    # 6.11 Determine correct endpoint and parameter mapping based on range requirements
     if days_back > 90:
         url = "https://archive-api.open-meteo.com/v1/archive"
         params = {
@@ -516,11 +987,11 @@ def fetch_weather_integrated(lat, lon, start_date_str):
             "forecast_days": 14
         }
         is_hourly = True
+        
     try:
         responses = openmeteo.weather_api(url, params=params)
         response = responses[0]
         
-        # 2. Extract arrays based on endpoint format definitions
         if is_hourly:
             hourly = response.Hourly()
             et_values = hourly.Variables(0).ValuesAsNumpy()
@@ -535,7 +1006,7 @@ def fetch_weather_integrated(lat, lon, start_date_str):
             df_hourly = pd.DataFrame({"time": dates, "et0": et_values, "rain": precip_values})
             df_hourly['time'] = df_hourly['time'].dt.tz_convert(None) 
             
-            # Convert hourly metric variables down to daily inches
+            # Convert metric (mm) to inches and group by day
             df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
             df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
             df_daily['Rain (in)'] = df_daily['rain'] / 25.4
@@ -554,35 +1025,35 @@ def fetch_weather_integrated(lat, lon, start_date_str):
             df_daily['time'] = df_daily['time'].dt.tz_convert(None)
             
         df_daily['time'] = df_daily['time'].dt.normalize()
+        # Record the successful fetch so the cooldown timer starts now
+        _record_api_fetch(weather_log_path)
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
         
     except Exception as e:
         st.error(f"Weather API Error: {e}")
         return None
 
-# --- Execution ---
-# Map the request check dynamically to the activation timestamp of the current zone
+
+# 7.3 Weather Processing and Data Merger
 zone_start_date_str = current_zone.get("start_date", str(datetime.now().date() - pd.Timedelta(days=7)))
+df_api = fetch_weather_integrated(lat, lon, zone_start_date_str, WEATHER_LOG)
 
-df_api = fetch_weather_integrated(lat, lon, zone_start_date_str)
-
+# Always load the local archive as the base; merge fresh API data if available
+df_permanent = load_weather_history()
 if df_api is not None:
-    # 1. Archive new data to permanent storage
     archive_weather(df_api)
-    
-    # 2. Load the full history and merge with new API data
-    df_permanent = load_weather_history()
+    df_permanent = load_weather_history()  # reload after archiving
     df_daily = pd.concat([df_permanent, df_api]).drop_duplicates(subset='time', keep='last').sort_values('time')
-    
-    # 3. Ensure 'time' is normalized across the board
+elif not df_permanent.empty:
+    df_daily = df_permanent.sort_values('time')
+if df_api is not None or not df_permanent.empty:
     df_daily['time'] = pd.to_datetime(df_daily['time']).dt.normalize()
     
-    # 4. FIXED: Retain all historical entries up to the zone activation threshold 
-    # instead of cutting the data frame down to a hard 92-day count limit
+    # Enforce threshold constraints to retain structural history
     earliest_allowed_date = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=180)
     df_daily = df_daily[df_daily['time'] >= earliest_allowed_date]
     
-    # 5. Merge Zone-Specific Irrigation Logs
+    # Merge local zone schedules and database records
     all_logs = load_logs()
     zone_logs = all_logs.get(active_zone_name, [])
     
@@ -595,19 +1066,21 @@ if df_api is not None:
     else:
         df_daily['Irrigation (in)'] = 0.0
 
-    # 6. Split into History and Forecast for the UI
+    # Separate dataframes into respective operational views
     today_dt = pd.Timestamp(datetime.now().date()).normalize()
     df_history = df_daily[df_daily['time'] < today_dt].copy()
     df_forecast = df_daily[df_daily['time'] >= today_dt].copy()
 
 
-
-
-#### 7. DEFICIT CALCULATION (Isolated per Zone)
-    # 7.1 Determine this zone's specific starting point
+# ==============================================================================
+# 8. DEFICIT CALCULATION (7-DAY ROLLING STARTING WARMUP)
+# ==============================================================================
     zone_start_str = current_zone.get("start_date", str(datetime.now().date()))
     zone_start_ts = pd.Timestamp(zone_start_str).normalize()
-    mask = (df_daily['time'] >= zone_start_ts) & (df_daily['time'] <= today_dt)
+    
+    # Establish previous rolling window to prevent cold start assumptions
+    warmup_start_ts = zone_start_ts - pd.Timedelta(days=7)
+    mask = (df_daily['time'] >= warmup_start_ts) & (df_daily['time'] <= today_dt)
     zone_weather = df_daily.loc[mask].sort_values('time')
     
     running_deficit = 0.0
@@ -620,19 +1093,18 @@ if df_api is not None:
     current_deficit = running_deficit
     gallons = current_deficit * area * 0.623
     runtime = gallons / flow if flow > 0 else 0
-        
-    
-    
-    
-    
-#### 8. Dashboard Metrics
+
+
+# ==============================================================================
+# 9. MAIN DASHBOARD METRICS
+# ==============================================================================
     st.markdown(f"### {active_prop} : {active_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
     st.divider()
+    
     seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum() if len(df_forecast) >= 7 else df_forecast['ET0 (in)'].sum()
     seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum() if len(df_forecast) >= 7 else df_forecast['Rain (in)'].sum()
-    today_et = df_forecast.iloc[0]['ET0 (in)'] if not df_forecast.empty else 0.0
-    today_rain = df_forecast.iloc[0]['Rain (in)'] if not df_forecast.empty else 0.0
     
+    # Establish system recommendation warning boundaries
     if current_deficit < ad_limit:
         status_msg = "✋ Wait to Water"
     else:
@@ -640,106 +1112,104 @@ if df_api is not None:
         
     m1, m2, m3, m4 = st.columns(4)
     
-    # 1. Water to Apply 
+    # Column A: Water to Apply
     m1.metric(
         label="Water to Apply", 
         value=f"{current_deficit:.2f}\"",
-        help="The current root-zone moisture deficit. This represents the amount of water needed to bring the soil back up to field capacity (full saturation)."
+        help="The current root-zone moisture deficit relative to field capacity."
     )
     
-    # 2. Allowable Depletion 
+    # Column B: Allowable Depletion
     m2.metric(
         label="Allowable Depletion", 
         value=f"{ad_limit:.2f}\"",
-        help="The maximum depth of water (in inches) allowed to deplete from the root zone before plant health experiences drought stress. Calculated via: Root Depth × PAW × MAD%."
+        help="The maximum water allowed to deplete before plant health experiences crop stress."
     )
     
-    # 3. 7-Day ET Forecast 
+    # Column C: Cumulative ET Forecast
     m3.metric(
         label="7-Day ET Forecast", 
         value=f"{seven_day_et:.2f}\"",
-        help="The total cumulative atmospheric water loss predicted over the next week. This is the sum of moisture evaporating from the soil and transpiring through the plants."
+        help="Total atmospheric moisture loss modeled over the next week."
     )
     
-    # 4. 7-Day Rain Forecast 
+    # Column D: Cumulative Rain Forecast
     m4.metric(
         label="7-Day Rain Forecast", 
         value=f"{seven_day_rain:.2f}\"",
-        help="The total cumulative natural precipitation expected over the next 7 days based on real-time weather coordinates."
+        help="Total precipitation expected over the next week."
     )
     
     st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
     st.divider()
   
-    # Guidance Logic based on Forecast
-    if seven_day_rain >  current_deficit and  current_deficit > 0:
-        st.warning(f"🌧️ **Rain is coming:** The 7-day forecast shows **{seven_day_rain:.2f}\"** of rain. You may want to skip watering today!")
-    elif  current_deficit <= 0:
+    # Immediate Guidance Callouts
+    if seven_day_rain > current_deficit and current_deficit > 0:
+        st.warning(f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!")
+    elif current_deficit <= 0:
         st.success(f"✅ **Soil is Hydrated!**")
     else:
-        st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill the profile.")
-  
-  
-  
-  
-#### 9.1 Graphs & Tables
+        st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity.")
+
+
+# ==============================================================================
+# 10. VISUAL ANALYTICS & TABLES
+# ==============================================================================
 st.divider()
 with st.expander("📈 View Water Balance Graph", expanded=True):
     st.write(f"### 📈 Water Balance for {active_zone_name}")
 
-    # 9.2 Setup Time Window (The "Secret Sauce" that fixed the blank screen)
     if not df_daily.empty:
         now_dt = pd.Timestamp(datetime.now().date()).normalize()
-    # Calculation for the "Default View" (7 days back, 14 forward)
-    view_start = now_dt - pd.Timedelta(days=7)
-    view_end = now_dt + pd.Timedelta(days=14)
-    lookback_days = 180  # Updated to display up to 180 days of history on the chart timeline
-    data_start = now_dt - pd.Timedelta(days=lookback_days)
-    df_zoom = df_daily[df_daily['time'] >= data_start].copy()
-    
-    # Common X-Axis with restricted initial domain (the "Zoom")
-    x_axis = alt.X('time:T', 
-                   title='Date', 
-                   scale=alt.Scale(domain=[view_start, view_end]), # <--- This sets the initial zoom
-                   axis=alt.Axis(format='%b %d'))
+        
+        # Configure Default View Zoom Bounds
+        view_start = now_dt - pd.Timedelta(days=7)
+        view_end = now_dt + pd.Timedelta(days=14)
+        lookback_days = 180  
+        data_start = now_dt - pd.Timedelta(days=lookback_days)
+        df_zoom = df_daily[df_daily['time'] >= data_start].copy()
+        
+        # Define Unified Interactive X-Axis Scale
+        x_axis = alt.X('time:T', 
+                       title='Date', 
+                       scale=alt.Scale(domain=[view_start.strftime('%Y-%m-%d'), view_end.strftime('%Y-%m-%d')]),
+                       axis=alt.Axis(format='%b %d'))
 
-    # --- 9.3 Create a Layered Chart (Bars for Water In, Line for Water Out) ---
-    
-    #  ET Line (Water Loss)
-    et_chart = alt.Chart(df_zoom).mark_line(strokeWidth=3, color='#FF8C00').encode(
-        x=alt.X('time:T', title='Date'),
-        y=alt.Y('ET0 (in):Q', title='Inches'),
-        tooltip=['time:T', 'ET0 (in):Q']
-    )
+        # Chart Layer A: Evapotranspiration Line
+        et_chart = alt.Chart(df_zoom).mark_line(strokeWidth=3, color='#FF8C00').encode(
+            x=x_axis,
+            y=alt.Y('ET0 (in):Q', title='Inches'),
+            tooltip=['time:T', 'ET0 (in):Q']
+        )
 
-    #  Rain Bars (Water Gain)
-    rain_chart = alt.Chart(df_zoom).mark_bar(opacity=0.5, color='#ADD8E6').encode(
-        x='time:T',
-        y='Rain (in):Q',
-        tooltip=['time:T', 'Rain (in):Q']
-    )
+        # Chart Layer B: Rainfall Bars
+        rain_chart = alt.Chart(df_zoom).mark_bar(opacity=0.5, color='#ADD8E6').encode(
+            x=x_axis,
+            y='Rain (in):Q',
+            tooltip=['time:T', 'Rain (in):Q']
+        )
 
-    #  Irrigation Bars (Water Gain)
-    irr_chart = alt.Chart(df_zoom).mark_bar(size=10, color='#003366').encode(
-        x='time:T',
-        y='Irrigation (in):Q',
-        tooltip=['time:T', 'Irrigation (in):Q']
-    )
+        # Chart Layer C: Irrigation Events
+        irr_chart = alt.Chart(df_zoom).mark_bar(size=10, color='#003366').encode(
+            x=x_axis,
+            y='Irrigation (in):Q',
+            tooltip=['time:T', 'Irrigation (in):Q']
+        )
 
-    #  Today Marker
-    today_line = alt.Chart(pd.DataFrame({'time': [now_dt]})).mark_rule(
-        color='red', strokeDash=[5,5], strokeWidth=2
-    ).encode(x='time:T')
+        # Chart Layer D: Today Reference Marker
+        today_line = alt.Chart(pd.DataFrame({'time': [now_dt]})).mark_rule(
+            color='red', strokeDash=[5,5], strokeWidth=2
+        ).encode(x=x_axis)
 
-    # Combine all layers
-    # .interactive(bind_y=False) allows scrolling through time without messsing up the Y axis scale
-    final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
-        height=400
-    ).interactive(bind_y=False)
 
-    st.altair_chart(final_chart, use_container_width=True)
+        # Combine, render, and freeze scale properties to prevent scrolling issues
+        final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
+            height=400
+        ).interactive(bind_y=False)
 
-# Legend Key (Centered)
+        st.altair_chart(final_chart, use_container_width=True)
+
+    # Centered Explanatory Key Legend
     st.markdown("""
     <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
         <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
@@ -749,7 +1219,7 @@ with st.expander("📈 View Water Balance Graph", expanded=True):
     </div>
     """, unsafe_allow_html=True)
 
-    #### 9.5 Data Tables
+# Forecast and Archive Tables View
 with st.expander("📋 View Forecast & History Tables", expanded=False):
     tab1, tab2 = st.tabs(["🗓️ Forecast (Next 14 Days)", "📜 History (Past 90 Days)"])
     with tab1:
@@ -758,27 +1228,23 @@ with st.expander("📋 View Forecast & History Tables", expanded=False):
         st.dataframe(df_history.sort_values('time', ascending=False).set_index("time").style.format("{:.2f}"), use_container_width=True)
 
 
-    
-    
-    
-#### 10. Global Water Usage Tracker & Master Editor
+# ==============================================================================
+# 11. GLOBAL WATER USAGE TRACKER & DATASET LEDGER
+# ==============================================================================
 st.divider()
 st.header("📈 Global Water Usage Tracker")
 
 all_logs = load_logs()
 
 if all_logs:
-    # 1. Prepare Data - Using consistent keys for the DataFrame
     combined_data = []
     for zone, events in all_logs.items():
-        # Get zone profile for area/flow to calculate gallons
         z_prof = profiles.get(zone, profiles[list(profiles.keys())[0]])
         z_area = z_prof.get("area", 1000)
         z_flow = z_prof.get("flow", 5.0)
         
         for event in events:
             mins = event.get("minutes", 0)
-            # Math: Gallons = Minutes * Flow Rate
             gallons_calc = mins * z_flow
             combined_data.append({
                 "Date": event.get("date"),
@@ -797,27 +1263,16 @@ if all_logs:
         total_inches = usage_df['Inches'].sum()
         total_mins = usage_df['Minutes'].sum()
 
-        # 2. Summary Metrics - Now using 'Minutes' which exists in the DF
+        # Render Totals Cards
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Events", len(usage_df))
-        col2.metric(
-            "Total Volume", 
-            f"{total_gal:,.0f} gal", 
-            help="Sum of all water used across all zones for this property."
-        )
-        col3.metric(
-            "Total Depth", 
-            f"{total_inches:.2f}\"", 
-            help="Cumulative inches of water applied (useful for seasonal tracking)."
-        )
-        col4.metric(
-            "Total Run Time", 
-            f"{total_mins:,.0f} min"
-        )
+        col2.metric("Total Volume", f"{total_gal:,.0f} gal", help="Cumulative volume used across all zones.")
+        col3.metric("Total Depth", f"{total_inches:.2f}\"", help="Cumulative irrigation depth applied.")
+        col4.metric("Total Run Time", f"{total_mins:,.0f} min")
 
-        # 3. The Master Editor Expander
+        # Core Ledger Interactive Editor Setup
         with st.expander("📂 View & Edit Full Irrigation Ledger", expanded=True):
-            st.caption("Editing **Minutes** or **Zone** will automatically recalculate the **Inches** based on that Zone's profile.")
+            st.caption("Editing **Minutes** or **Zone** will automatically recalculate **Inches** based on Zone parameters.")
             
             edited_df = st.data_editor(
                 usage_df,
@@ -833,16 +1288,14 @@ if all_logs:
                 key="global_master_editor"
             )
 
-            # 4. Save Logic: Recalculate and Re-structure
+            # Execution Engine for Interactive Ledger Modifications
             if not usage_df.equals(edited_df):
                 new_logs = {}
                 for _, row in edited_df.iterrows():
-                    # --- FIX: Skip empty/invalid rows ---
                     if pd.isna(row["Date"]) or pd.isna(row["Zone"]):
                         continue
                     z_name = row["Zone"]
                     mins = row["Minutes"]
-                    # Get specific profile for this row's zone to do the math accurately
                     z_prof = profiles.get(z_name, profiles[list(profiles.keys())[0]])
                     z_flow = z_prof.get("flow", 5.0)
                     z_area = z_prof.get("area", 1000)
@@ -852,32 +1305,22 @@ if all_logs:
                     if z_name not in new_logs:
                         new_logs[z_name] = []
                     
-                    # --- FIX: Ensure the date is a clean string ---
                     date_val = row["Date"]
-                    if hasattr(date_val, "date"):
-                        date_str = str(date_val.date())
-                    else:
-                        date_str = str(date_val)
+                    date_str = str(date_val.date()) if hasattr(date_val, "date") else str(date_val)
                     
                     new_logs[z_name].append({
-                        "date": str(row["Date"].date()) if hasattr(row["Date"], "date") else str(row["Date"]),
+                        "date": date_str,
                         "minutes": mins,
                         "inches": calc_inches
                     })
                     
-                    # Double check we have data before saving
                 if new_logs:
-                    with open(LOG_FILE, "w") as f:
-                        json.dump(new_logs, f)
-                    st.success("Global logs updated!")
+                    data_manager.save_json(LOG_FILE, new_logs)
+                    st.success("Global logs updated and water depths recalculated!")
                     st.rerun()
-                
-                with open(LOG_FILE, "w") as f:
-                    json.dump(new_logs, f)
-                st.success("Global logs updated and inches recalculated!")
-                st.rerun()
 
-            # 5. Visual Analytics
+
+            # Global Volume Comparison chart
             st.write("### 📊 Gallons Used per Zone")
             zone_usage_gal = edited_df.groupby("Zone")["Gallons"].sum()
             st.bar_chart(zone_usage_gal)
@@ -885,10 +1328,11 @@ if all_logs:
         st.info("No data found in logs.")
 else:
     st.info("No watering events logged yet. Use the sidebar to log your first event!")
-    
-    
-    
-#### 11. Math & Science Expander
+
+
+# ==============================================================================
+# 12. SCIENCE REFERENCE LIBRARY
+# ==============================================================================
 st.divider()
 with st.expander("📚 Reference, Math & Science Methodology", expanded=False):
     tab_audit, tab_calc, tab_science, tab_refs = st.tabs([
@@ -904,16 +1348,16 @@ with tab_audit:
         st.write("**Soil Constants**")
         st.write(f"Field Capacity (FC): {fc_inft:.2f} in/ft")
         st.write(f"Wilting Point (PWP): {pwp_inft:.2f} in/ft")
-        st.write(f"Available Water (AW): {aw_per_foot:.2f} in/ft") # Updated variable
+        st.write(f"Available Water (AW): {aw_per_foot:.2f} in/ft") 
     with col_b:
         st.write("**Root Zone & Depletion**")
         st.write(f"Root Zone (RZ): {rz_ft:.2f} ft ({depth_in} in)")
-        st.write(f"Plant Available Water (PAW): {paw_total:.2f} inches") # Updated variable
-        st.write(f"Allowable Depletion (AD): {ad_limit:.2f} inches") # Updated variable
+        st.write(f"Plant Available Water (PAW): {paw_total:.2f} inches") 
+        st.write(f"Allowable Depletion (AD): {ad_limit:.2f} inches") 
         
     st.divider()
     depletion_status = (current_deficit / ad_limit) * 100 if ad_limit > 0 else 0
-    st.info(f"**Current Status:** Your deficit is {current_deficit:.2f}\". This is {depletion_status:.1f}% of your Allowable Depletion.")
+    st.info(f"**Current Status:** Your deficit is {current_deficit:.2f}\". This represents {depletion_status:.1f}% of your Allowable Depletion limit.")
 
 with tab_calc:
     st.write(f"### Soil Profile: {soil_choice}")
@@ -940,47 +1384,35 @@ with tab_calc:
 
 with tab_science:
     st.write("### Evapotranspiration (ET₀) Explained")
-    
     st.markdown("""
-    The "Water Loss" value is **ET₀** (Reference Evapotranspiration), calculated via the **FAO-56 Penman-Monteith equation**.
+    The water loss value is calculated using reference **ET₀** parameters mapped back to the standard **FAO-56 Penman-Monteith Equation**.
     
-    **Environmental Factors Used:**
-    1. **Solar Radiation:** Energy for evaporation.
-    2. **Temperature:** High heat increases atmospheric pull.
-    3. **Humidity:** Drier air accelerates water loss.
-    4. **Wind:** Removes the humid layer around leaves.
+    **Environmental Inputs Tracked:**
+    1. **Solar Radiation:** Primary thermodynamic energy engine.
+    2. **Ambient Temp:** Temperature gradients driving pressure.
+    3. **Relative Humidity:** Dry atmospheric vapor pressure gradients.
+    4. **Wind Speed:** Boundary layer transport factors.
     """)
-    st.info("Data Source: Open-Meteo API using high-resolution weather models.")
+    st.info("Data Source: High-resolution Open-Meteo meteorological API.")
     
 with tab_refs:
     st.write("### References")
     st.markdown("""
-    **Reference:** Evaluating Field Capacity, Wilting Point, Saturation, and Plant Available Water
+    **Reference A: Estimating Soil Physics Limits**
+    * Saxton, Keith S., and Walter J. Rawls. 'Estimating Soil Water Characteristics from Texture, Organic Matter, and Salinity.' *Soil Science Society of America Journal*, vol. 70, no. 5, 2006, pp. 1569-1578.
     
-        Saxton, Keith S., and Walter J. Rawls. 'Estimating Soil Water 
-        Characteristics from Texture, Organic Matter, and Salinity.' *Soil Science 
-        Society of America Journal*, vol. 70, no. 5, 2006, pp. 1569-1578.
-    
-    **Reference:** FAO-56 Penman-Monteith Evaluating Evapotranspiration
-    
-        Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for 
-        Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
+    **Reference B: Reference Crop ET Evaluations**
+    * Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
     """)
-    
-    
-    
-    
-#### 99. Backup Utility
-import shutil
-import subprocess  # Added to trigger Windows File Explorer when running locally
-import platform
 
+
+# ==============================================================================
+# 13. SYSTEM SECURITY & BACKUP UTILITIES
+# ==============================================================================
 st.divider()
 with st.expander("🛡️ Data Security & Backups"):
-    
-
     st.write("### 📥 Download App Data")
-    st.caption("Save your configurations and watering ledgers directly to your device.")
+    st.caption("Export active profiles and logging archives safely to disk.")
     
     profiles_string = json.dumps(profiles, indent=4)
     all_logs = load_logs()
@@ -1006,36 +1438,36 @@ with st.expander("🛡️ Data Security & Backups"):
 
     st.divider()
     st.write("### 🚀 Server System Backups")
-    st.write("Click below to create a timestamped clone of all properties, zones, and history.")
+    st.write("Click below to build a timestamped configuration clone of directory assets.")
     
     if st.button("🚀 Create Instant Backup"):
-        # Create a unique folder name: e.g., "Backup_2024-05-20_14-30"
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         current_backup_path = os.path.join(BACKUP_DIR, f"Backup_{timestamp}")
         
         try:
-            # Copy the entire IrrigationData folder to the new backup location
             shutil.copytree(DATA_DIR, current_backup_path)
-            st.success(f"Backup Successful! Files stored in: `{current_backup_path}`")
+            st.success(f"Backup Successful! Archive stored in local path: `{current_backup_path}`")
             
-            # List current backups
+            # Show historical catalog
             st.write("### Recent Backups on Disk:")
             all_backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
-            for b in all_backups[:5]: # Show last 5
+            for b in all_backups[:5]: 
                 st.text(f"📁 {b}")
                 
         except Exception as e:
             st.error(f"Backup failed: {e}")
 
-    st.caption("Note: This creates a local copy on your machine. For extra safety, copy the 'Backups' folder to a cloud drive.")
+    st.caption("Note: Local platform checks protect standard container services. Secure physical directories systematically.")
 
 
+# Footer Branding
 st.divider()
+mode_text = "cloud" if SUPABASE_READY else "local"
 st.markdown(
-    """
+    f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • v0.34
+        Irrigation Dashboard • {mode_text} • v0.35
     </div>
-    """, 
+    """,
     unsafe_allow_html=True
 )
