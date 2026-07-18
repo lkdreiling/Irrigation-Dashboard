@@ -48,73 +48,99 @@ class MockConnection:
     session = MockSession()
 
 # 0.1 Setup Database Connection (Fallback to Streamlit SQL Connection)
+
+# Schema creation/migration used to run as plain top-level code, which meant all 10
+# CREATE/ALTER statements below fired on every single rerun -- i.e. every click, every
+# widget interaction -- not just once. @st.cache_resource runs this exactly once per server
+# process (shared across every session on that process) and skips it on every rerun after.
+@st.cache_resource
+def _init_schema(_conn):
+    with _conn.session as session:
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS app_users (
+                username VARCHAR(50) PRIMARY KEY,
+                password_hash VARCHAR(256) NOT NULL
+            );
+        """))
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS properties (
+                user_id VARCHAR(100) NOT NULL,
+                property_name VARCHAR(100) NOT NULL,
+                zip_code VARCHAR(20) NOT NULL,
+                PRIMARY KEY (user_id, property_name)
+            );
+        """))
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS zones (
+                user_id VARCHAR(100) NOT NULL,
+                property_name VARCHAR(100) NOT NULL,
+                zone_name VARCHAR(100) NOT NULL,
+                area INTEGER NOT NULL DEFAULT 1000,
+                flow NUMERIC NOT NULL DEFAULT 5,
+                soil VARCHAR(50) NOT NULL DEFAULT 'Loam',
+                depth INTEGER NOT NULL DEFAULT 12,
+                mad INTEGER NOT NULL DEFAULT 50,
+                start_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                PRIMARY KEY (user_id, property_name, zone_name)
+            );
+        """))
+        # Migration for zones tables created before the plant/Kc column existed --
+        # CREATE TABLE IF NOT EXISTS above is a no-op against the already-live production table.
+        session.execute(text("""
+            ALTER TABLE zones ADD COLUMN IF NOT EXISTS plant VARCHAR(80) NOT NULL DEFAULT 'Cool-Season Turf (Bluegrass, Fescue, Ryegrass)';
+        """))
+        # Migration for the Easy/Advanced irrigation-spec mode -- head_type only matters
+        # in Easy Mode (drives the flow estimate), but is stored for every zone either way.
+        session.execute(text("""
+            ALTER TABLE zones ADD COLUMN IF NOT EXISTS head_type VARCHAR(20) NOT NULL DEFAULT 'Spray';
+        """))
+        # unit_count is the homeowner-countable quantity Easy Mode derives area/flow from
+        # (head count for Spray/Rotor, plant count for Drip); plant_size only applies to Drip.
+        session.execute(text("""
+            ALTER TABLE zones ADD COLUMN IF NOT EXISTS unit_count INTEGER NOT NULL DEFAULT 4;
+        """))
+        session.execute(text("""
+            ALTER TABLE zones ADD COLUMN IF NOT EXISTS plant_size VARCHAR(40) NOT NULL DEFAULT 'Medium (typical shrub)';
+        """))
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS watering_logs (
+                user_id VARCHAR(100) NOT NULL,
+                property_name VARCHAR(100) NOT NULL,
+                zone_name VARCHAR(100) NOT NULL,
+                log_date DATE NOT NULL,
+                minutes NUMERIC NOT NULL,
+                inches NUMERIC NOT NULL
+            );
+        """))
+        # Shared weather cache: one row per location/day, reused across every user and
+        # zone at that location so a single Open-Meteo fetch serves everyone, and so the
+        # archive survives Streamlit Cloud container reboots (unlike the local JSON/
+        # in-memory caches, which are wiped on every reboot).
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS weather_cache (
+                lat NUMERIC NOT NULL,
+                lon NUMERIC NOT NULL,
+                log_date DATE NOT NULL,
+                et0_in NUMERIC NOT NULL,
+                rain_in NUMERIC NOT NULL,
+                PRIMARY KEY (lat, lon, log_date)
+            );
+        """))
+        session.execute(text("""
+            CREATE TABLE IF NOT EXISTS weather_fetch_meta (
+                lat NUMERIC NOT NULL,
+                lon NUMERIC NOT NULL,
+                last_fetch_utc TIMESTAMP NOT NULL,
+                PRIMARY KEY (lat, lon)
+            );
+        """))
+        session.commit()
+
 DB_CONNECTION_ERROR = None
 try:
     conn = st.connection("postgresql", type="sql")
-    # Initialize shared cloud tables in Postgres if database is online
     try:
-        with conn.session as session:
-            session.execute(text("""
-                CREATE TABLE IF NOT EXISTS app_users (
-                    username VARCHAR(50) PRIMARY KEY,
-                    password_hash VARCHAR(256) NOT NULL
-                );
-            """))
-            session.execute(text("""
-                CREATE TABLE IF NOT EXISTS properties (
-                    user_id VARCHAR(100) NOT NULL,
-                    property_name VARCHAR(100) NOT NULL,
-                    zip_code VARCHAR(20) NOT NULL,
-                    PRIMARY KEY (user_id, property_name)
-                );
-            """))
-            session.execute(text("""
-                CREATE TABLE IF NOT EXISTS zones (
-                    user_id VARCHAR(100) NOT NULL,
-                    property_name VARCHAR(100) NOT NULL,
-                    zone_name VARCHAR(100) NOT NULL,
-                    area INTEGER NOT NULL DEFAULT 1000,
-                    flow NUMERIC NOT NULL DEFAULT 5,
-                    soil VARCHAR(50) NOT NULL DEFAULT 'Loam',
-                    depth INTEGER NOT NULL DEFAULT 12,
-                    mad INTEGER NOT NULL DEFAULT 50,
-                    start_date DATE NOT NULL DEFAULT CURRENT_DATE,
-                    PRIMARY KEY (user_id, property_name, zone_name)
-                );
-            """))
-            session.execute(text("""
-                CREATE TABLE IF NOT EXISTS watering_logs (
-                    user_id VARCHAR(100) NOT NULL,
-                    property_name VARCHAR(100) NOT NULL,
-                    zone_name VARCHAR(100) NOT NULL,
-                    log_date DATE NOT NULL,
-                    minutes NUMERIC NOT NULL,
-                    inches NUMERIC NOT NULL
-                );
-            """))
-            # Shared weather cache: one row per location/day, reused across every user and
-            # zone at that location so a single Open-Meteo fetch serves everyone, and so the
-            # archive survives Streamlit Cloud container reboots (unlike the local JSON/
-            # in-memory caches, which are wiped on every reboot).
-            session.execute(text("""
-                CREATE TABLE IF NOT EXISTS weather_cache (
-                    lat NUMERIC NOT NULL,
-                    lon NUMERIC NOT NULL,
-                    log_date DATE NOT NULL,
-                    et0_in NUMERIC NOT NULL,
-                    rain_in NUMERIC NOT NULL,
-                    PRIMARY KEY (lat, lon, log_date)
-                );
-            """))
-            session.execute(text("""
-                CREATE TABLE IF NOT EXISTS weather_fetch_meta (
-                    lat NUMERIC NOT NULL,
-                    lon NUMERIC NOT NULL,
-                    last_fetch_utc TIMESTAMP NOT NULL,
-                    PRIMARY KEY (lat, lon)
-                );
-            """))
-            session.commit()
+        _init_schema(conn)
     except Exception as e:
         DB_CONNECTION_ERROR = f"Connected, but table setup failed: {e}"
 except Exception as e:
@@ -128,6 +154,25 @@ if isinstance(conn, MockConnection):
     st.sidebar.caption(f"\U0001F4BE Local-only mode (DB not connected){': ' + DB_CONNECTION_ERROR if DB_CONNECTION_ERROR else ''}")
 else:
     st.sidebar.caption("☁️ Cloud sync active")
+
+# 0.15 Session-Scoped Read Cache
+# Streamlit reruns this entire script top-to-bottom on every widget interaction (every
+# button click, slider drag, selectbox change). Any DB read sitting at module level --
+# properties, zone profiles, watering logs, weather history -- was firing again on every
+# single rerun, each one a real network round trip to the Supabase pooler, sequentially,
+# before the page could even render. These helpers cache read results in st.session_state
+# instead, so each piece of data is fetched once per session and reused on every later
+# rerun; call sites that write update or invalidate the matching cache key directly rather
+# than relying on a short query ttl to eventually expire.
+def _cache_get(key, loader):
+    if key not in st.session_state:
+        st.session_state[key] = loader()
+    return st.session_state[key]
+
+
+def _cache_invalidate(key):
+    st.session_state.pop(key, None)
+
 
 # 0.2 User DB Authentication Helpers
 def db_register_user(username, password):
@@ -184,7 +229,7 @@ def load_properties_from_cloud():
         df = conn.query(
             "SELECT property_name, zip_code FROM properties WHERE user_id = :user_id",
             params={"user_id": st.session_state.user_id},
-            ttl=0,
+            ttl=5,
         )
         if not df.empty:
             return df.set_index("property_name")["zip_code"].to_dict()
@@ -296,7 +341,7 @@ def load_logs_from_cloud(active_property):
                 WHERE user_id = :user_id AND property_name = :property_name
             """,
             params={"user_id": st.session_state.user_id, "property_name": active_property},
-            ttl=0,
+            ttl=5,
         )
         if not df.empty:
             return df
@@ -412,7 +457,10 @@ with profile_col:
 user_paths = data_manager.get_user_paths(st.session_state.user_id)
 PROP_LIST_FILE = user_paths["prop_list"]
 
-properties_dict = load_properties_from_cloud() or data_manager.load_json(PROP_LIST_FILE, {})
+properties_dict = _cache_get(
+    f"cache_properties::{st.session_state.user_id}",
+    lambda: load_properties_from_cloud() or data_manager.load_json(PROP_LIST_FILE, {}),
+)
 
 # Render Property Selector in Sidebar
 st.sidebar.header("🏠 Active Property")
@@ -443,7 +491,6 @@ if "active_prop" not in st.session_state or st.session_state.active_prop not in 
 active_prop = st.sidebar.selectbox("Select Active Property", prop_options, index=prop_options.index(st.session_state.active_prop))
 st.session_state.active_prop = active_prop
 active_zip = properties_dict[active_prop]
-st.sidebar.caption("Manage or add properties from the 🏡 Properties tab above.")
 
 # ==============================================================================
 # PROPERTIES TAB CONTENT (list + add new property)
@@ -452,11 +499,45 @@ if selected_tab == "Properties":
     st.header("🏡 Your Properties")
     st.caption("Manage the properties on your account. Pick which one is active from the sidebar.")
 
-    prop_table = pd.DataFrame(
-        [{"Property": name, "Zip Code": zip_code, "Active": "✅" if name == active_prop else ""}
-         for name, zip_code in properties_dict.items()]
-    )
-    st.dataframe(prop_table, use_container_width=True, hide_index=True)
+    for prop_name, prop_zip_code in list(properties_dict.items()):
+        row_name, row_zip, row_active, row_delete = st.columns([3, 2, 1, 1])
+        row_name.write(f"**{prop_name}**")
+        row_zip.write(prop_zip_code)
+        row_active.write("✅" if prop_name == active_prop else "")
+        if row_delete.button("🗑️ Delete", key=f"delete_prop_{prop_name}", use_container_width=True):
+            try:
+                with conn.session as session:
+                    session.execute(
+                        text("DELETE FROM zones WHERE property_name = :prop AND user_id = :user_id"),
+                        {"prop": prop_name, "user_id": st.session_state.user_id}
+                    )
+                    session.execute(
+                        text("DELETE FROM watering_logs WHERE property_name = :prop AND user_id = :user_id"),
+                        {"prop": prop_name, "user_id": st.session_state.user_id}
+                    )
+                    session.execute(
+                        text("DELETE FROM properties WHERE property_name = :prop AND user_id = :user_id"),
+                        {"prop": prop_name, "user_id": st.session_state.user_id}
+                    )
+                    session.commit()
+            except Exception:
+                pass
+
+            properties_dict.pop(prop_name, None)
+            data_manager.save_json(PROP_LIST_FILE, properties_dict)
+
+            # Wipe the property's local zone/log/weather JSON files too, mirroring how zone
+            # deletion wipes that zone's profile entry rather than leaving orphaned files behind.
+            deleted_paths = data_manager.get_prop_paths_for_user(st.session_state.user_id, prop_name)
+            for stale_file in (deleted_paths["db"], deleted_paths["log"], deleted_paths["weather"]):
+                if os.path.exists(stale_file):
+                    os.remove(stale_file)
+
+            if st.session_state.active_prop == prop_name:
+                st.session_state.active_prop = None
+
+            st.toast(f"🗑️ Deleted property '{prop_name}' and its zones/history.")
+            st.rerun()
 
     st.divider()
     st.subheader("➕ Add New Property")
@@ -498,13 +579,13 @@ def load_profiles_from_supabase():
     try:
         df = conn.query(
             """
-                SELECT zone_name, area, flow, soil, depth, mad, start_date
+                SELECT zone_name, area, flow, soil, plant, head_type, unit_count, plant_size, depth, mad, start_date
                 FROM zones
                 WHERE user_id = :user_id
                   AND property_name = :property_name
             """,
             params={"user_id": st.session_state.user_id, "property_name": active_prop},
-            ttl=0,
+            ttl=5,
         )
         if df.empty:
             return None
@@ -518,6 +599,10 @@ def load_profiles_from_supabase():
                     "area": int(row.get("area", 1000)),
                     "flow": float(row.get("flow", 5)),
                     "soil": row.get("soil", "Loam"),
+                    "plant": row.get("plant", "Cool-Season Turf (Bluegrass, Fescue, Ryegrass)"),
+                    "head_type": row.get("head_type", "Spray"),
+                    "unit_count": int(row.get("unit_count", 4)),
+                    "plant_size": row.get("plant_size", "Medium (typical shrub)"),
                     "depth": int(row.get("depth", 12)),
                     "mad": int(row.get("mad", 50)),
                     "start_date": str(row.get("start_date", str(datetime.now().date()))),
@@ -536,16 +621,20 @@ def save_profiles_to_supabase(profiles_dict):
             for zone_name, config in profiles_dict.items():
                 session.execute(text("""
                     INSERT INTO zones (
-                        user_id, property_name, zone_name, area, flow, soil, depth, mad, start_date
+                        user_id, property_name, zone_name, area, flow, soil, plant, head_type, unit_count, plant_size, depth, mad, start_date
                     )
                     VALUES (
-                        :user_id, :property_name, :zone_name, :area, :flow, :soil, :depth, :mad, :start_date
+                        :user_id, :property_name, :zone_name, :area, :flow, :soil, :plant, :head_type, :unit_count, :plant_size, :depth, :mad, :start_date
                     )
                     ON CONFLICT (user_id, property_name, zone_name)
                     DO UPDATE SET
                         area = EXCLUDED.area,
                         flow = EXCLUDED.flow,
                         soil = EXCLUDED.soil,
+                        plant = EXCLUDED.plant,
+                        head_type = EXCLUDED.head_type,
+                        unit_count = EXCLUDED.unit_count,
+                        plant_size = EXCLUDED.plant_size,
                         depth = EXCLUDED.depth,
                         mad = EXCLUDED.mad,
                         start_date = EXCLUDED.start_date;
@@ -556,6 +645,10 @@ def save_profiles_to_supabase(profiles_dict):
                     "area": int(config.get("area", 1000)),
                     "flow": float(config.get("flow", 5)),
                     "soil": config.get("soil", "Loam"),
+                    "plant": config.get("plant", "Cool-Season Turf (Bluegrass, Fescue, Ryegrass)"),
+                    "head_type": config.get("head_type", "Spray"),
+                    "unit_count": int(config.get("unit_count", 4)),
+                    "plant_size": config.get("plant_size", "Medium (typical shrub)"),
                     "depth": int(config.get("depth", 12)),
                     "mad": int(config.get("mad", 50)),
                     "start_date": config.get("start_date", str(datetime.now().date())),
@@ -574,6 +667,10 @@ def load_profiles():
             "area": 1200,
             "flow": 8.0,
             "soil": "Loam",
+            "plant": "Cool-Season Turf (Bluegrass, Fescue, Ryegrass)",
+            "head_type": "Spray",
+            "unit_count": 4,
+            "plant_size": "Medium (typical shrub)",
             "depth": 6,
             "mad": 50,
             "start_date": str(datetime.now().date() - pd.Timedelta(days=7))
@@ -607,7 +704,7 @@ def load_logs():
             WHERE property_name = :prop AND user_id = :user_id
         """
         try:
-            df = conn.query(query, params={"prop": active_prop, "user_id": st.session_state.user_id}, ttl=0)
+            df = conn.query(query, params={"prop": active_prop, "user_id": st.session_state.user_id}, ttl=5)
         except Exception:
             df = pd.DataFrame()
         
@@ -637,6 +734,21 @@ def load_logs():
                 "inches": row['inches']
             })
     return logs
+
+
+def _logs_cache_key():
+    return f"cache_logs::{st.session_state.user_id}::{active_prop}"
+
+
+def get_logs_cached():
+    """Session-cached watering logs for the active property. load_logs() hits the DB, and
+    was previously called from three separate places (Dashboard, Ledger, backup export) --
+    each one a fresh network round trip even within the same rerun."""
+    return _cache_get(_logs_cache_key(), load_logs)
+
+
+def invalidate_logs_cache():
+    _cache_invalidate(_logs_cache_key())
 
 
 # 1.2 Save Local Log to Database & JSON Backup
@@ -677,6 +789,8 @@ def save_log(zone, minutes, inches_applied):
     })
     data_manager.save_json(LOG_FILE, local_logs)
 
+    invalidate_logs_cache()
+
 
 # 1.2b Shared Cloud Weather Cache (rounded lat/lon so every user/zone at the same
 # location reuses one fetch, and history survives Streamlit Cloud container reboots)
@@ -695,7 +809,7 @@ def load_weather_cache_from_cloud(lat, lon):
                 FROM weather_cache WHERE lat = :lat AND lon = :lon
             """,
             params={"lat": coord_lat, "lon": coord_lon},
-            ttl=0,
+            ttl=300,  # weather_cache only changes via the ~20hr fetch gate below, so this can cache far longer than the other queries
         )
         return df
     except Exception:
@@ -737,7 +851,7 @@ def get_weather_last_fetch(lat, lon):
             df = conn.query(
                 "SELECT last_fetch_utc FROM weather_fetch_meta WHERE lat = :lat AND lon = :lon",
                 params={"lat": coord_lat, "lon": coord_lon},
-                ttl=0,
+                ttl=300,  # only changes via the ~20hr fetch gate this feeds into
             )
             if not df.empty:
                 return pd.to_datetime(df.iloc[0]["last_fetch_utc"]).to_pydatetime().replace(tzinfo=None)
@@ -801,12 +915,34 @@ def load_weather_history(lat, lon):
     return pd.DataFrame(columns=['time', 'ET0 (in)', 'Rain (in)'])
 
 
+def _weather_cache_keys(lat, lon):
+    coord = _weather_coord_key(lat, lon)
+    return f"cache_weather_hist::{coord}", f"cache_weather_lastfetch::{coord}"
+
+
+def get_weather_history_cached(lat, lon):
+    hist_key, _ = _weather_cache_keys(lat, lon)
+    return _cache_get(hist_key, lambda: load_weather_history(lat, lon))
+
+
+def get_weather_last_fetch_cached(lat, lon):
+    _, fetch_key = _weather_cache_keys(lat, lon)
+    return _cache_get(fetch_key, lambda: get_weather_last_fetch(lat, lon))
+
+
+def invalidate_weather_cache(lat, lon):
+    hist_key, fetch_key = _weather_cache_keys(lat, lon)
+    _cache_invalidate(hist_key)
+    _cache_invalidate(fetch_key)
+
+
 # ==============================================================================
 # 2. APPLICATION INITIALIZATION
 # ==============================================================================
 
-# 2.1 Load Local App Profiles
-profiles = load_profiles()
+# 2.1 Load Local App Profiles (cached per user+property; mutated in place by the
+# rename/add/remove/auto-save actions below, which persist those mutations via save_profiles())
+profiles = _cache_get(f"cache_profiles::{st.session_state.user_id}::{active_prop}", load_profiles)
 
 
 # ==============================================================================
@@ -826,6 +962,10 @@ if not zone_list:
             "area": 1000,
             "flow": 5,
             "soil": "Loam",
+            "plant": "Cool-Season Turf (Bluegrass, Fescue, Ryegrass)",
+            "head_type": "Spray",
+            "unit_count": 4,
+            "plant_size": "Medium (typical shrub)",
             "depth": 6,
             "mad": 50,
             "start_date": str(datetime.now().date())
@@ -848,7 +988,7 @@ def handle_rename_submit():
                     text("""
                         UPDATE watering_logs 
                         SET zone_name = :new_name 
-                        WHERE property = :prop AND zone_name = :old_name AND user_id = :user_id
+                        WHERE property_name = :prop AND zone_name = :old_name AND user_id = :user_id
                     """),
                     {
                         "new_name": new_name, 
@@ -863,7 +1003,9 @@ def handle_rename_submit():
         
         save_profiles(profiles)
         st.toast(f"✏️ Renamed to {new_name}!")
-        st.rerun()
+        # No st.rerun() here -- Streamlit already reruns automatically once an on_change
+        # callback like this one finishes; calling it explicitly inside a callback is a no-op
+        # (and prints a warning at the top of the page).
 
 
 # 3.3 Action Callback: Add New Custom Zone
@@ -875,13 +1017,19 @@ def handle_add_submit():
             "area": 1000,
             "flow": 5,
             "soil": "Loam",
+            "plant": "Cool-Season Turf (Bluegrass, Fescue, Ryegrass)",
+            "head_type": "Spray",
+            "unit_count": 4,
+            "plant_size": "Medium (typical shrub)",
             "depth": 12,
             "mad": 50,
             "start_date": str(datetime.now().date())
         }
         save_profiles(profiles)
         st.toast(f"🌱 {custom_new_zone} added successfully!")
-        st.rerun()
+        # No st.rerun() here -- Streamlit already reruns automatically once an on_change
+        # callback like this one finishes; calling it explicitly inside a callback is a no-op
+        # (and prints a warning at the top of the page).
 
 
 # 3.4 Display Zone Selection UI Columns
@@ -961,61 +1109,183 @@ st.sidebar.header("💧 Irrigation Specs")
 current_area = int(current_zone.get("area", 1000))
 current_flow = int(current_zone.get("flow", 5))
 saved_soil = current_zone.get("soil", "Loam")
+saved_plant = current_zone.get("plant", "Cool-Season Turf (Bluegrass, Fescue, Ryegrass)")
+saved_head_type = current_zone.get("head_type", "Spray")
+current_unit_count = int(current_zone.get("unit_count", 4))
+saved_plant_size = current_zone.get("plant_size", "Medium (typical shrub)")
 current_depth = int(current_zone.get("depth", 12))
 current_mad = int(current_zone.get("mad", 50))
 current_start_dt = current_zone.get("start_date", str(datetime.now().date()))
 
-# Render UI Controls
-area = st.sidebar.number_input("Zone Area (sq ft)", min_value=1, value=current_area, step=1, format="%d")
-flow = st.sidebar.number_input("Zone Flow (GPM)", min_value=1, value=current_flow, step=1, format="%d")
+# 4.1 Easy / Advanced mode -- a session-level view toggle (same stored zone data either way,
+# just fewer/derived inputs in Easy). Defaults to Advanced so today's behavior doesn't change
+# for anyone who doesn't touch the toggle.
+with st.sidebar:
+    spec_mode = option_menu(
+        menu_title=None,
+        options=["Easy", "Advanced"],
+        icons=["magic", "sliders"],
+        menu_icon="cast",
+        default_index=1,
+        orientation="horizontal",
+        key="spec_mode_menu"
+    )
 
-soil_types = list(core_logic.SOIL_DATA.keys())
+# 4.2 Plant Type -- first in both modes; same widget drives both, so it's always in sync.
+plant_types = list(core_logic.PLANT_DATA.keys())
 try:
-    soil_index = soil_types.index(saved_soil)
+    plant_index = plant_types.index(saved_plant)
 except ValueError:
-    soil_index = soil_types.index("Loam")
-soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
-
-
-depth_in = st.sidebar.slider(
-    "Root Depth (in)", 
-    min_value=1,   
-    max_value=24,  
-    value=current_depth, 
-    help="The target active root depth profile. Deeper roots have access to a larger structural water reservoir."
+    plant_index = 0
+plant_choice = st.sidebar.selectbox(
+    "Plant Type",
+    plant_types,
+    index=plant_index,
+    help="What's actually planted in this zone. Drives the crop coefficient (Kc) that scales reference ET down to real plant water use."
 )
-mad = st.sidebar.slider(
-    "Manageable Allowable Depletion (MAD %)",
-    min_value=10,
-    max_value=80,
-    value=current_mad,
-    step=5,
-    help="The percentage of soil water allowed to dry out before triggering an irrigation cycle."
-)
+
+if spec_mode == "Easy":
+    # Head type first -- it decides whether we're counting heads or plants next.
+    head_types = list(core_logic.HEAD_TYPE_DATA.keys())
+    try:
+        head_type_index = head_types.index(saved_head_type)
+    except ValueError:
+        head_type_index = 0
+    head_type_choice = st.sidebar.selectbox(
+        "Irrigation Head Type",
+        head_types,
+        index=head_type_index,
+        help="Spray heads sit closer together and use more GPM per sq ft than Rotor heads; Drip is sized off plant count instead of head count."
+    )
+
+    # Area isn't asked directly -- most homeowners can't measure a zone's square footage, but
+    # they can walk out and count heads (or plants, for Drip). We derive area and flow from
+    # that instead. See core_logic.estimate_area_and_flow.
+    if head_type_choice == "Drip":
+        plant_sizes = list(core_logic.PLANT_SIZE_AREA_SQFT.keys())
+        try:
+            plant_size_index = plant_sizes.index(saved_plant_size)
+        except ValueError:
+            plant_size_index = plant_sizes.index("Medium (typical shrub)")
+        plant_size_choice = st.sidebar.selectbox(
+            "Typical Plant Size",
+            plant_sizes,
+            index=plant_size_index,
+            help="Drip emitters/dripline aren't something you can count the way sprinkler heads are, so this stands in for how much area each plant's root zone covers."
+        )
+        unit_count = st.sidebar.number_input(
+            "Number of Plants on This Zone",
+            min_value=1, value=current_unit_count, step=1, format="%d"
+        )
+    else:
+        plant_size_choice = saved_plant_size  # not shown/used outside Drip, just carried over
+        unit_count = st.sidebar.number_input(
+            f"Number of {head_type_choice} Heads",
+            min_value=1, value=current_unit_count, step=1, format="%d"
+        )
+
+    soil_types = list(core_logic.SOIL_DATA.keys())
+    try:
+        soil_index = soil_types.index(saved_soil)
+    except ValueError:
+        soil_index = soil_types.index("Loam")
+    soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
+
+    mad = st.sidebar.slider(
+        "Manageable Allowable Depletion (MAD %)",
+        min_value=10,
+        max_value=80,
+        value=current_mad,
+        step=5,
+        help="The percentage of soil water allowed to dry out before triggering an irrigation cycle."
+    )
+
+    # Depth isn't asked in Easy Mode -- defaulted from the selected plant type instead.
+    depth_in = core_logic.PLANT_DATA.get(plant_choice, {}).get("DefaultDepth", 12)
+
+    est_area, est_flow, est_radius, est_area_per_plant = core_logic.estimate_area_and_flow(
+        head_type_choice, unit_count, plant_size_choice
+    )
+    area = max(1, est_area)
+    flow = max(1, round(est_flow))
+
+    if head_type_choice == "Drip":
+        st.sidebar.caption(f"📐 Estimated area: **{area} sq ft** — {unit_count} plant(s) × ~{est_area_per_plant} sq ft each.")
+        st.sidebar.caption(f"💧 Estimated flow: **{flow} GPM** — ~0.6 GPH/sq ft drip grid assumption.")
+    else:
+        st.sidebar.caption(f"📐 Estimated area: **{area} sq ft** — {unit_count} head(s) × {est_radius:.1f}² ft radius each.")
+        st.sidebar.caption(f"💧 Estimated flow: **{flow} GPM** — {unit_count} head(s) × {core_logic.HEAD_TYPE_DATA[head_type_choice]['avg_gpm_per_head']:.1f} GPM/head.")
+
+    if flow > 15:
+        st.sidebar.warning(f"⚠️ {flow} GPM is a lot for one zone — most homes can't reliably supply this. Consider Rotor heads (fewer, longer-throw) instead of Spray, or fewer units per zone.")
+
+    head_type_for_save = head_type_choice
+    unit_count_for_save = unit_count
+    plant_size_for_save = plant_size_choice
+
+else:  # Advanced
+    area = st.sidebar.number_input("Zone Area (sq ft)", min_value=1, value=current_area, step=1, format="%d")
+    flow = st.sidebar.number_input("Zone Flow (GPM)", min_value=1, value=current_flow, step=1, format="%d")
+
+    soil_types = list(core_logic.SOIL_DATA.keys())
+    try:
+        soil_index = soil_types.index(saved_soil)
+    except ValueError:
+        soil_index = soil_types.index("Loam")
+    soil_choice = st.sidebar.selectbox("Soil", soil_types, index=soil_index)
+
+    depth_in = st.sidebar.slider(
+        "Root Depth (in)",
+        min_value=1,
+        max_value=24,
+        value=current_depth,
+        help="The target active root depth profile. Deeper roots have access to a larger structural water reservoir."
+    )
+    mad = st.sidebar.slider(
+        "Manageable Allowable Depletion (MAD %)",
+        min_value=10,
+        max_value=80,
+        value=current_mad,
+        step=5,
+        help="The percentage of soil water allowed to dry out before triggering an irrigation cycle."
+    )
+
+    # Not editable in Advanced -- carried over from Easy Mode's last selection (or the zone default).
+    head_type_for_save = saved_head_type
+    unit_count_for_save = current_unit_count
+    plant_size_for_save = saved_plant_size
 
 # Auto-Save Engine: Updates automatically if any parameter is altered
-if (area != current_area or 
-    flow != current_flow or 
-    soil_choice != saved_soil or 
-    depth_in != current_depth or 
+if (area != current_area or
+    flow != current_flow or
+    soil_choice != saved_soil or
+    plant_choice != saved_plant or
+    head_type_for_save != saved_head_type or
+    unit_count_for_save != current_unit_count or
+    plant_size_for_save != saved_plant_size or
+    depth_in != current_depth or
     mad != current_mad):
-    
+
     profiles[active_zone_name] = {
         "zip": active_zip,
-        "area": area, 
-        "flow": flow, 
-        "soil": soil_choice, 
-        "depth": depth_in, 
+        "area": area,
+        "flow": flow,
+        "soil": soil_choice,
+        "plant": plant_choice,
+        "head_type": head_type_for_save,
+        "unit_count": unit_count_for_save,
+        "plant_size": plant_size_for_save,
+        "depth": depth_in,
         "mad": mad,
-        "start_date": current_start_dt  
+        "start_date": current_start_dt
     }
-    
+
     if active_zone_name != "Default Zone" and "Default Zone" in profiles:
         del profiles["Default Zone"]
-        
+
     save_profiles(profiles)
     st.rerun()
-    
+
 st.sidebar.divider()
 
 
@@ -1066,6 +1336,9 @@ fc_inft = fc_raw * 12
 pwp_inft = pwp_raw * 12
 rz_ft = depth_in / 12
 aw_capacity_inft = (fc_raw - pwp_raw) * 12
+
+plant_info = core_logic.PLANT_DATA.get(plant_choice, core_logic.PLANT_DATA["Cool-Season Turf (Bluegrass, Fescue, Ryegrass)"])
+kc_value = plant_info["Kc"]
 
 
 
@@ -1167,8 +1440,9 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
 
 # Always load the archive first (cloud cache if connected, else local JSON) -- this is what
 # actually backs the displayed history/forecast, so the live API only ever needs to fill in
-# what's missing from it.
-df_permanent = load_weather_history(lat, lon)
+# what's missing from it. Session-cached: only a real fetch below (at most every ~20h)
+# invalidates and re-reads this, so unrelated reruns don't re-hit the DB for it.
+df_permanent = get_weather_history_cached(lat, lon)
 
 zone_start_date = pd.to_datetime(
     current_zone.get("start_date", str(datetime.now().date() - pd.Timedelta(days=7)))
@@ -1192,7 +1466,7 @@ else:
 # Durable gate: skip the network call entirely if this location was already fetched recently.
 # This lives in the DB/local-JSON (not st.cache_data or the requests_cache sqlite file), so it
 # still holds even after a Streamlit Cloud container reboot wipes those in-process caches.
-last_fetch = get_weather_last_fetch(lat, lon)
+last_fetch = get_weather_last_fetch_cached(lat, lon)
 needs_fetch = last_fetch is None or (datetime.utcnow() - last_fetch) > timedelta(hours=20)
 
 df_api = None
@@ -1201,7 +1475,10 @@ if needs_fetch:
 
 if df_api is not None:
     archive_weather(df_api, lat, lon)
-    df_permanent = load_weather_history(lat, lon)  # reload after archiving
+    # A real fetch just landed -- force one fresh read so the session cache picks up what
+    # was just archived instead of serving the pre-fetch snapshot for the rest of this session.
+    invalidate_weather_cache(lat, lon)
+    df_permanent = get_weather_history_cached(lat, lon)  # reload after archiving
     df_daily = pd.concat([df_permanent, df_api]).drop_duplicates(subset='time', keep='last').sort_values('time')
 elif not df_permanent.empty:
     df_daily = df_permanent.sort_values('time')
@@ -1213,7 +1490,7 @@ if df_api is not None or not df_permanent.empty:
     df_daily = df_daily[df_daily['time'] >= earliest_allowed_date]
     
     # Merge local zone schedules and database records
-    all_logs = load_logs()
+    all_logs = get_logs_cached()
     zone_logs = all_logs.get(active_zone_name, [])
     
     if zone_logs:
@@ -1234,22 +1511,32 @@ if df_api is not None or not df_permanent.empty:
 # ==============================================================================
 # 8. DEFICIT CALCULATION (7-DAY ROLLING STARTING WARMUP)
 # ==============================================================================
-    zone_start_str = current_zone.get("start_date", str(datetime.now().date()))
-    zone_start_ts = pd.Timestamp(zone_start_str).normalize()
-    
-    # Establish previous rolling window to prevent cold start assumptions
-    warmup_start_ts = zone_start_ts - pd.Timedelta(days=7)
-    mask = (df_daily['time'] >= warmup_start_ts) & (df_daily['time'] <= today_dt)
-    zone_weather = df_daily.loc[mask].sort_values('time')
-    
-    running_deficit = 0.0
-    for idx, row in zone_weather.iterrows():
-        running_deficit += row['ET0 (in)']
-        running_deficit -= (row['Rain (in)'] + row['Irrigation (in)'])
-        if running_deficit < 0:
-            running_deficit = 0.0
-            
-    current_deficit = running_deficit
+    if not zone_logs:
+        # Never-watered zone: assume field capacity (0" deficit) rather than running the
+        # warmup loop below, which pulls in real historical ET/rain from before this zone
+        # existed. That antecedent-moisture backfill is only meaningful once there's an
+        # actual watering history to reconcile it against -- for a brand-new zone it just
+        # produces a nonzero "deficit" the app has no real evidence for.
+        current_deficit = 0.0
+    else:
+        # Anchor the rolling window at the first real watering event, not zone_start_date
+        # minus a 7-day pre-buffer. The first log is the last known moment the soil was
+        # actually brought toward field capacity; backfilling ET debt from before it (e.g.
+        # a whole week predating the zone's own creation) produced an inflated deficit the
+        # app had no real evidence for the instant someone logged their first watering.
+        first_log_ts = pd.to_datetime(min(log["date"] for log in zone_logs)).normalize()
+        mask = (df_daily['time'] >= first_log_ts) & (df_daily['time'] <= today_dt)
+        zone_weather = df_daily.loc[mask].sort_values('time')
+
+        running_deficit = 0.0
+        for idx, row in zone_weather.iterrows():
+            etc_in = row['ET0 (in)'] * kc_value  # crop-adjusted water use, not raw reference ET0
+            running_deficit += etc_in
+            running_deficit -= (row['Rain (in)'] + row['Irrigation (in)'])
+            if running_deficit < 0:
+                running_deficit = 0.0
+
+        current_deficit = running_deficit
     gallons = current_deficit * area * 0.623
     runtime = gallons / flow if flow > 0 else 0
 
@@ -1306,6 +1593,13 @@ if df_api is not None or not df_permanent.empty:
         # Immediate Guidance Callouts
         if seven_day_rain > current_deficit and current_deficit > 0:
             st.warning(f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!")
+        elif current_deficit <= 0 and not zone_logs:
+            # Never-watered zone reading 0" is an assumption (field capacity), not a measurement --
+            # pair it with a reference runtime computed as if the zone were bone dry (PWP) so a
+            # first-time user has a number to start from instead of just "you're fine, do nothing."
+            full_gallons = paw_total * area * 0.623
+            full_runtime = full_gallons / flow if flow > 0 else 0
+            st.info(f"🌱 **New Zone:** Starting at 0\" deficit (assumed field capacity) until real readings accumulate. If this zone were completely dry, a full soak would take an estimated **{full_runtime:.1f} minutes** at current settings.")
         elif current_deficit <= 0:
             st.success(f"✅ **Soil is Hydrated!**")
         else:
@@ -1396,7 +1690,7 @@ if selected_tab == "Ledger":
     st.divider()
     st.header("📈 Global Water Usage Tracker")
 
-    all_logs = load_logs()
+    all_logs = get_logs_cached()
 
     if all_logs:
         combined_data = []
@@ -1478,6 +1772,7 @@ if selected_tab == "Ledger":
 
                     if new_logs:
                         data_manager.save_json(LOG_FILE, new_logs)
+                        invalidate_logs_cache()
                         st.success("Global logs updated and water depths recalculated!")
                         st.rerun()
 
@@ -1496,76 +1791,206 @@ if selected_tab == "Ledger":
 # 12. SCIENCE REFERENCE LIBRARY
 # ==============================================================================
 if selected_tab == "Reference":
-    st.divider()
-    with st.expander("📚 Reference, Math & Science Methodology", expanded=False):
-        tab_audit, tab_calc, tab_science, tab_refs = st.tabs([
-            "📊 Soil Physics Logic", 
-            "🧮 Calculation Logic", 
-            "🔬 Weather Science",
-            "📚 References"
-        ])
+    # Ordered to follow the actual pipeline: the three input domains (soil, plant,
+    # weather) first, then the calculation tab that combines all three, then sourcing.
+    tab_audit, tab_plant, tab_science, tab_calc, tab_refs = st.tabs([
+        "📊 Soil Physics Logic",
+        "🌱 Plant Water Use",
+        "🔬 Weather Science",
+        "🧮 Calculation Logic",
+        "📚 References"
+    ])
 
     with tab_audit:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.write("**Soil Constants**")
-            st.write(f"Field Capacity (FC): {fc_inft:.2f} in/ft")
-            st.write(f"Wilting Point (PWP): {pwp_inft:.2f} in/ft")
-            st.write(f"Available Water (AW): {aw_per_foot:.2f} in/ft") 
-        with col_b:
-            st.write("**Root Zone & Depletion**")
-            st.write(f"Root Zone (RZ): {rz_ft:.2f} ft ({depth_in} in)")
-            st.write(f"Plant Available Water (PAW): {paw_total:.2f} inches") 
-            st.write(f"Allowable Depletion (AD): {ad_limit:.2f} inches") 
-
-        st.divider()
-        depletion_status = (current_deficit / ad_limit) * 100 if ad_limit > 0 else 0
-        st.info(f"**Current Status:** Your deficit is {current_deficit:.2f}\". This represents {depletion_status:.1f}% of your Allowable Depletion limit.")
-
-    with tab_calc:
         st.write(f"### Soil Profile: {soil_choice}")
-        st.info("💡 **How we calculate your 'Soil Tank' capacity:**")
+        st.info("💡 **How we size your soil's 'water tank' from its texture:**")
+        st.markdown("""
+        Every soil texture holds a different amount of water against gravity (**Field
+        Capacity**) and a different amount still physically available to roots before
+        wilting (**Permanent Wilting Point**). The gap between the two, scaled to the
+        active root depth, is the total water "tank" this zone draws from before the
+        **Manageable Allowable Depletion (MAD)** threshold triggers an irrigation cycle.
+        """)
         st.latex(r"AW = FC - PWP")
         st.caption(f"Available Water: {fc_inft/12:.3f} - {pwp_inft/12:.3f} = **{aw_per_foot/12:.3f} in/in**")
         st.latex(r"PAW = AW \times RZ")
         st.caption(f"Plant Available Water: {aw_per_foot:.2f} in/ft × {rz_ft:.2f} ft = **{paw_total:.2f} inches**")
         st.latex(r"AD = PAW \times MAD")
         st.caption(f"Allowable Depletion: {paw_total:.2f} in × {mad/100:.2f} = **{ad_limit:.2f} inches**")
-        st.divider()
 
-        st.table(pd.DataFrame({
-            "Parameter": ["AWC (Soil Capacity)", "Root Depth", "Total Tank Size (PAW)", "MAD (Buffer)", "Allowable Depletion (AD)"],
-            "Value": [f"{(aw_per_foot/12):.3f} in/in", f"{depth_in} in", f"{paw_total:.2f} in", f"{mad}%", f"{ad_limit:.2f} in"]
-        }))
-        st.divider()
-        st.write("### Volume & Runtime Logic")
-        st.markdown(f"""
-        1. **Net Depth Needed:** **{current_deficit:.3f}"**
-        2. **Water Volume:** {current_deficit:.3f}" × {area} sq ft × 0.623 = **{gallons:.1f} Gallons**
-        3. **Runtime:** {gallons:.1f} gal / {flow} GPM = **{runtime:.1f} Minutes**
+        st.write("#### Soil Reference Table (all soil types)")
+        soil_df = pd.DataFrame([
+            {
+                "Soil Type": name,
+                "FC (in/ft)": info["FC"] * 12,
+                "PWP (in/ft)": info["PWP"] * 12,
+                "AW (in/ft)": (info["FC"] - info["PWP"]) * 12,
+            }
+            for name, info in core_logic.SOIL_DATA.items()
+        ])
+        st.dataframe(
+            soil_df.style.apply(
+                lambda row: ["background-color: rgba(0,150,0,0.15)" if row["Soil Type"] == soil_choice else "" for _ in row],
+                axis=1
+            ).format({"FC (in/ft)": "{:.2f}", "PWP (in/ft)": "{:.2f}", "AW (in/ft)": "{:.2f}"}),
+            hide_index=True,
+            use_container_width=True
+        )
+        depletion_status = (current_deficit / ad_limit) * 100 if ad_limit > 0 else 0
+        st.caption(f"**Current Status:** Your deficit is {current_deficit:.2f}\", or {depletion_status:.1f}% of your Allowable Depletion limit. Soil constants are Saxton & Rawls (2006) texture-class estimates — see References tab.")
+
+    with tab_plant:
+        st.write(f"### Plant Profile: {plant_choice}")
+        st.info("💡 **How we scale atmospheric water loss down to what this plant actually uses:**")
+        st.markdown("""
+        The weather engine reports **ET₀** — reference evapotranspiration, the water a
+        standardized well-watered grass reference surface would lose. Different plants use
+        meaningfully less (or, rarely, more) than that reference. The **crop coefficient (Kc)**
+        scales ET₀ into **ETc**, the actual water use for what's planted in this zone, before
+        it's added to the daily deficit.
         """)
+        st.latex(r"ET_c = ET_0 \times K_c")
+        st.caption(f"For {plant_choice}: ET₀ × **{kc_value:.2f}** = ETc")
+
+        st.write("#### Kc Reference Table (all plant types)")
+        plant_df = pd.DataFrame([
+            {"Plant Type": name, "Kc": info["Kc"]}
+            for name, info in core_logic.PLANT_DATA.items()
+        ])
+        st.dataframe(
+            plant_df.style.apply(
+                lambda row: ["background-color: rgba(0,150,0,0.15)" if row["Plant Type"] == plant_choice else "" for _ in row],
+                axis=1
+            ).format({"Kc": "{:.1f}"}),
+            hide_index=True,
+            use_container_width=True
+        )
+        st.caption("Kc values are mid-season approximations from FAO-56 (turf/tree ranges) and the WUCOLS landscape-coefficient method (ornamental groupings) — see References tab.")
 
     with tab_science:
-        st.write("### Evapotranspiration (ET₀) Explained")
+        st.write(f"### Weather Profile: {active_zip}")
+        st.info("💡 **Where the daily ET₀ and rain numbers actually come from:**")
         st.markdown("""
-        The water loss value is calculated using reference **ET₀** parameters mapped back to the standard **FAO-56 Penman-Monteith Equation**.
-
-        **Environmental Inputs Tracked:**
-        1. **Solar Radiation:** Primary thermodynamic energy engine.
-        2. **Ambient Temp:** Temperature gradients driving pressure.
-        3. **Relative Humidity:** Dry atmospheric vapor pressure gradients.
-        4. **Wind Speed:** Boundary layer transport factors.
+        Reference evapotranspiration (**ET₀**) estimates how much water a well-watered
+        reference grass surface loses to the atmosphere on a given day, driven by solar
+        radiation, temperature, humidity, and wind. Open-Meteo computes it upstream with
+        the **FAO-56 Penman-Monteith equation** and this app pulls in the finished daily
+        value as an input — the Penman-Monteith math itself doesn't run locally, ET₀ just
+        feeds the Kc scaling and deficit loop covered in the other tabs.
         """)
-        st.info("Data Source: High-resolution Open-Meteo meteorological API.")
+        st.latex(r"ET_0 = \frac{0.408\,\Delta(R_n-G) + \gamma \frac{900}{T+273} u_2 (e_s - e_a)}{\Delta + \gamma(1+0.34u_2)}")
+        if not df_history.empty:
+            last_row = df_history.sort_values('time').iloc[-1]
+            st.caption(f"Most recent fetched day ({pd.to_datetime(last_row['time']).date()}): ET₀ = **{last_row['ET0 (in)']:.2f} in**, Rain = **{last_row['Rain (in)']:.2f} in**")
+
+        st.write("#### Environmental Inputs Tracked")
+        inputs_df = pd.DataFrame({
+            "Input": ["Solar Radiation", "Ambient Temperature", "Relative Humidity", "Wind Speed"],
+            "Role": [
+                "Primary thermodynamic energy engine",
+                "Temperature gradient driving vapor pressure",
+                "Dry atmospheric vapor pressure gradient",
+                "Boundary layer transport factor",
+            ],
+        })
+        st.dataframe(inputs_df, hide_index=True, use_container_width=True)
+        st.caption("Data Source: High-resolution Open-Meteo meteorological API, computed per FAO-56 — see References tab.")
+
+    with tab_calc:
+        st.write(f"### Water Balance: {active_zone_name}")
+        st.info("💡 **How the daily deficit becomes a sprinkler runtime:**")
+        st.markdown("""
+        Every day, this zone's soil moisture deficit grows by crop-adjusted water use
+        (**ETc**, from the Plant Water Use tab) and shrinks by rain plus any logged
+        irrigation, floored at field capacity (0" deficit — it never carries below that,
+        even after a large rain event). Once you're ready to water, that deficit converts
+        directly into a water volume and a sprinkler runtime using the zone's area and
+        flow rate.
+
+        **Never-watered zones are the one exception.** A zone with no logged watering
+        history skips this loop entirely and reads a flat 0" deficit, rather than
+        back-filling real historical ET/rain from before the zone existed. That
+        antecedent-moisture backfill only means something once there's an actual watering
+        history to reconcile it against — for a brand-new zone it would otherwise produce a
+        deficit the app has no real evidence for.
+        """)
+        st.latex(r"Deficit_{day} = Deficit_{day-1} + (ET_0 \times K_c) - (Rain + Irrigation)")
+        st.caption(f"This zone's **{plant_choice}** Kc of **{kc_value:.2f}** is baked into every day of that loop — see the *Plant Water Use* tab.")
+        st.latex(r"Gallons = Deficit \times Area \times 0.623")
+        st.caption(f"Water Volume: {current_deficit:.3f}\" × {area} sq ft × 0.623 = **{gallons:.1f} Gallons**")
+        st.latex(r"Runtime = \frac{Gallons}{Flow}")
+        st.caption(f"Runtime: {gallons:.1f} gal / {flow} GPM = **{runtime:.1f} Minutes**")
+
+        st.write("#### Runtime Breakdown")
+        st.dataframe(pd.DataFrame({
+            "Step": ["Net Depth Needed", "Water Volume", "Runtime"],
+            "Value": [f"{current_deficit:.3f}\"", f"{gallons:.1f} gal", f"{runtime:.1f} min"]
+        }), hide_index=True, use_container_width=True)
+
+        st.write("#### How Area & Flow Are Determined (Easy vs. Advanced Mode)")
+        st.info("💡 **Why this zone's area and GPM are what they are:**")
+        st.markdown("""
+        Advanced Mode asks for Zone Area and Zone Flow directly. Easy Mode asks for neither —
+        most homeowners can't measure a zone's square footage or know its flow rate, but they
+        *can* walk outside and count something. For Spray/Rotor, that's the number of heads on
+        the zone; for Drip, it's the number of plants (individual emitters or dripline footage
+        aren't practically countable the way heads are). Both area and flow are then derived
+        from that count instead of asked for.
+        """)
+        st.latex(r"Area \approx Heads \times Radius^2 \qquad Flow_{GPM} \approx Heads \times GPM_{per\ head}")
+        st.caption("Radius/GPM-per-head are averages for the selected head type; spacing = radius follows the same \"50% of diameter\" convention manufacturers use to publish matched-precipitation rates.")
+        st.latex(r"Area \approx Plants \times Area_{per\ plant} \qquad Flow_{GPM} \approx \frac{Area \times 0.6\ GPH/sq\ ft}{60}")
+        st.caption("Drip instead sizes area off plant count × a typical coverage footprint per plant size, then applies the same flat drip rate used in the Calculation Logic math above.")
+
+        if spec_mode == "Easy":
+            if head_type_choice == "Drip":
+                st.success(f"**This zone (Easy Mode):** {unit_count} plant(s) × ~{est_area_per_plant} sq ft each ≈ **{area} sq ft** → **{flow} GPM**")
+            else:
+                head_gpm = core_logic.HEAD_TYPE_DATA[head_type_choice]["avg_gpm_per_head"]
+                st.success(f"**This zone (Easy Mode):** {unit_count} {head_type_choice} head(s) × {est_radius:.1f}² ft ≈ **{area} sq ft**, × {head_gpm:.1f} GPM/head ≈ **{flow} GPM**")
+        else:
+            st.caption("This zone is in Advanced Mode right now, where Area and Flow are entered directly — switch to Easy Mode in the sidebar to see this zone's live estimate.")
+
+        head_ref_df = pd.DataFrame([
+            {"Head Type": "Spray", "Avg GPM/head": core_logic.HEAD_TYPE_DATA["Spray"]["avg_gpm_per_head"], "Avg Radius (ft)": core_logic.HEAD_TYPE_DATA["Spray"]["avg_radius_ft"], "Basis": "Per head"},
+            {"Head Type": "Rotor", "Avg GPM/head": core_logic.HEAD_TYPE_DATA["Rotor"]["avg_gpm_per_head"], "Avg Radius (ft)": core_logic.HEAD_TYPE_DATA["Rotor"]["avg_radius_ft"], "Basis": "Per head"},
+            {"Head Type": "Drip", "Avg GPM/head": None, "Avg Radius (ft)": None, "Basis": f"{core_logic.HEAD_TYPE_DATA['Drip']['gph_per_sqft']:.1f} GPH/sq ft flat rate"},
+        ])
+        st.dataframe(
+            head_ref_df.style.apply(
+                lambda row: ["background-color: rgba(0,150,0,0.15)" if row["Head Type"] == head_type_for_save else "" for _ in row],
+                axis=1
+            ).format({"Avg GPM/head": "{:.1f}", "Avg Radius (ft)": "{:.1f}"}, na_rep="—"),
+            hide_index=True,
+            use_container_width=True
+        )
+        st.caption("Averages compiled from Rain Bird, Hunter, Toro, and Orbit residential nozzle catalogs (irrigation_head_specs/head_database.csv in the repo) — see Reference E.")
+
+        st.write("#### Manual Watering Log Conversion")
+        st.markdown("Logging a runtime in minutes uses the matched-precipitation-rate formula to convert flow and area into an applied depth:")
+        st.latex(r"Rate_{in/hr} = \frac{96.25 \times GPM}{Area}")
+        manual_rate = (96.25 * flow / area) if area > 0 else 0
+        st.caption(f"This zone's rate: (96.25 × {flow}) / {area} = **{manual_rate:.3f} in/hr**. This app uses the unrounded 96.25 constant rather than the commonly published rounded 96.3 — same formula, tighter precision.")
+        st.caption("Precipitation-rate methodology follows Irrigation Association matched-precipitation guidance — see References tab.")
 
     with tab_refs:
         st.write("### References")
         st.markdown("""
-        **Reference A: Estimating Soil Physics Limits**
+        **Reference A: Soil Physics — Estimating Soil Water Characteristics**
         * Saxton, Keith S., and Walter J. Rawls. 'Estimating Soil Water Characteristics from Texture, Organic Matter, and Salinity.' *Soil Science Society of America Journal*, vol. 70, no. 5, 2006, pp. 1569-1578.
 
-        **Reference B: Reference Crop ET Evaluations**
+        **Reference B: Plant Water Use — Landscape Crop Coefficients (Kc)**
+        * Costello, Lawrence R., and Katherine S. Jones. *WUCOLS IV: Water Use Classification of Landscape Species*. California Center for Urban Horticulture, UC Davis, 2014.
+
+        **Reference C: Weather Science — Reference Crop ET Evaluations**
         * Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
+
+        **Reference D: Calculation Logic — Precipitation Rate & Runtime Methodology**
+        * Irrigation Association and American Society of Irrigation Consultants. *Landscape Irrigation Best Management Practices*. 2014. [irrigation.org](https://www.irrigation.org/IA/FileUploads/IA/Certification/BMPDesign_Install_Manage.pdf)
+        * Irrigation Association. *Turf and Landscape Irrigation Best Management Practices*. 2002 (rev.).
+
+        **Reference E: Easy Mode — Irrigation Head Flow & Radius Averages**
+        * Rain Bird, Hunter, Toro, and Orbit residential nozzle catalogs (spray, rotor, and drip product lines), compiled 2026-07-18. Full source datasheets and per-nozzle data in `irrigation_head_specs/` in this repo — see `SOURCES.md` there for the manufacturer-by-manufacturer breakdown.
         """)
 
 
@@ -1579,7 +2004,7 @@ if selected_tab == "Properties":
         st.caption("Export active profiles and logging archives safely to disk.")
 
         profiles_string = json.dumps(profiles, indent=4)
-        all_logs = load_logs()
+        all_logs = get_logs_cached()
         logs_string = json.dumps(all_logs, indent=4)
 
         dl_col1, dl_col2 = st.columns(2)
@@ -1630,7 +2055,7 @@ mode_text = "local" if isinstance(conn, MockConnection) else "cloud"
 st.markdown(
     f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • {mode_text} • v0.36
+        Irrigation Dashboard • {mode_text} • v0.37
     </div>
     """,
     unsafe_allow_html=True

@@ -1,0 +1,78 @@
+Manufacturer,Product_Line,Head_Type,Model,Arc_deg,Pressure_psi,Radius_ft,Flow_GPM,Emitter_GPH,Emitter_Spacing_in,Precip_in_hr,Notes,Source_File
+Rain Bird,VAN Series,Spray (fixed/adjustable arc),4-VAN,330,30,4,0.88,,,5.78,Near-max arc shown (330; family tops out below 360),RainBird_VAN_Series_Spray_Nozzles_Performance.pdf
+Rain Bird,VAN Series,Spray (fixed/adjustable arc),6-VAN,330,30,6,1.20,,,3.50,Near-max arc shown (330),RainBird_VAN_Series_Spray_Nozzles_Performance.pdf
+Rain Bird,VAN Series,Spray (fixed/adjustable arc),8-VAN,330,30,8,1.70,,,2.79,Near-max arc shown (330),RainBird_VAN_Series_Spray_Nozzles_Performance.pdf
+Rain Bird,VAN Series,Spray (fixed/adjustable arc),10-VAN,360,30,10,2.60,,,2.50,,RainBird_VAN_Series_Spray_Nozzles_Performance.pdf
+Rain Bird,VAN Series,Spray (fixed/adjustable arc),12-VAN,360,30,12,2.36,,,1.58,,RainBird_VAN_Series_Spray_Nozzles_Performance.pdf
+Rain Bird,VAN Series,Spray (fixed/adjustable arc),15-VAN,360,30,15,3.70,,,1.58,,RainBird_VAN_Series_Spray_Nozzles_Performance.pdf
+Rain Bird,VAN Series,Spray (fixed/adjustable arc),18-VAN,360,30,18,5.32,,,1.58,,RainBird_VAN_Series_Spray_Nozzles_Performance.pdf
+Rain Bird,MPR Series,Spray (matched-precip fixed),5F,360,30,5,0.41,,,1.58,,RainBird_MPRotator_Nozzle_Chart.pdf
+Rain Bird,MPR Series,Spray (matched-precip fixed),8F,360,30,8,1.05,,,1.58,,RainBird_MPRotator_Nozzle_Chart.pdf
+Rain Bird,MPR Series,Spray (matched-precip fixed),10F,360,30,10,1.58,,,1.52,,RainBird_MPRotator_Nozzle_Chart.pdf
+Rain Bird,MPR Series,Spray (matched-precip fixed),12F,360,30,12,2.60,,,1.74,,RainBird_MPRotator_Nozzle_Chart.pdf
+Rain Bird,MPR Series,Spray (matched-precip fixed),15F,360,30,15,3.70,,,1.58,,RainBird_MPRotator_Nozzle_Chart.pdf
+Rain Bird,5000 Series,Rotor,1.5 (Std Angle),360,45,35,1.54,,,0.24,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,2.0 (Std Angle),360,45,37,2.07,,,0.29,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,3.0 (Std Angle),360,45,39,3.09,,,0.37,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,4.0 (Std Angle),360,45,42,4.01,,,0.44,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,5.0 (Std Angle),360,45,43,5.09,,,0.48,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,6.0 (Std Angle),360,45,44,6.01,,,0.59,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,8.0 (Std Angle),360,45,44,8.03,,,0.92,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,1.0 LA (Low Angle),360,45,29,1.05,,,0.24,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,5000 Series,Rotor,3.0 LA (Low Angle),360,45,35,3.07,,,0.48,,RainBird_5000_Series_Rotor_Nozzle_Performance.pdf
+Rain Bird,R-VAN Series,Rotary (multi-stream),R-VAN14-360,360,45,14,1.27,,,0.62,,RainBird_R-VAN_Rotary_Nozzle_Performance.pdf
+Rain Bird,R-VAN Series,Rotary (multi-stream),R-VAN18-360,360,45,17,1.85,,,0.62,,RainBird_R-VAN_Rotary_Nozzle_Performance.pdf
+Rain Bird,R-VAN Series,Rotary (multi-stream),R-VAN24-360,360,45,23,3.48,,,0.63,,RainBird_R-VAN_Rotary_Nozzle_Performance.pdf
+Rain Bird,XFS Dripline,Drip/Micro,XFS-04 (0.42 GPH),,,,,0.42,12,,Pressure-compensating inline dripline; 8.5-60 psi range,RainBird_XFS_Dripline_TechSpec.pdf
+Rain Bird,XFS Dripline,Drip/Micro,XFS-06 (0.6 GPH),,,,,0.60,12,,Pressure-compensating inline dripline; 8.5-60 psi range,RainBird_XFS_Dripline_TechSpec.pdf
+Rain Bird,XFS Dripline,Drip/Micro,XFS-09 (0.9 GPH),,,,,0.90,12,,Pressure-compensating inline dripline; 8.5-60 psi range,RainBird_XFS_Dripline_TechSpec.pdf
+Hunter,Pro Adjustable,Spray (fixed/adjustable arc),4A,360,30,4,0.80,,,4.81,,Hunter_ProSpray_Nozzles_Performance_dripworks.pdf
+Hunter,Pro Adjustable,Spray (fixed/adjustable arc),6A,360,30,6,1.26,,,3.89,,Hunter_ProSpray_Nozzles_Performance_dripworks.pdf
+Hunter,Pro Adjustable,Spray (fixed/adjustable arc),8A,360,30,8,1.76,,,3.06,,Hunter_ProSpray_Nozzles_Performance_dripworks.pdf
+Hunter,Pro Adjustable,Spray (fixed/adjustable arc),10A,360,30,10,2.00,,,1.93,,Hunter_ProSpray_Nozzles_Performance_dripworks.pdf
+Hunter,Pro Adjustable,Spray (fixed/adjustable arc),12A,360,30,12,2.52,,,1.68,,Hunter_ProSpray_Nozzles_Performance_dripworks.pdf
+Hunter,Pro Adjustable,Spray (fixed/adjustable arc),15A,360,30,15,3.72,,,1.59,,Hunter_ProSpray_Nozzles_Performance_dripworks.pdf
+Hunter,Pro Adjustable,Spray (fixed/adjustable arc),17A,360,30,17,4.60,,,1.53,,Hunter_ProSpray_Nozzles_Performance_dripworks.pdf
+Hunter,PGP Ultra / I-20,Rotor,1.5 Blue,360,45,31,1.5,,,0.30,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,2.0 Blue,360,45,34,2.0,,,0.33,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,3.0 Blue,360,45,38,3.0,,,0.40,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,4.0 Blue,360,45,40,4.0,,,0.48,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,5.0 Blue,360,45,42,5.0,,,0.55,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,6.0 Blue,360,45,43,6.0,,,0.62,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,8.0 Blue,360,45,44,8.0,,,0.80,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,2.0LA Grey,360,50,28,2.1,,,0.52,,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,PGP Ultra / I-20,Rotor,MPR-30 Lt.Green,360,45,30,5.78,,,0.62,Matched-precipitation rotor nozzle option,Hunter_PGPUltra_Spec_dbc.pdf
+Hunter,MP Rotator,Rotary (multi-stream),MP1000,360,40,14,0.84,,,0.41,,Hunter_MPRotator_Spec_dbc.pdf
+Hunter,MP Rotator,Rotary (multi-stream),MP2000,360,40,19,1.48,,,0.39,,Hunter_MPRotator_Spec_dbc.pdf
+Hunter,MP Rotator,Rotary (multi-stream),MP3000,360,40,30,3.64,,,0.39,,Hunter_MPRotator_Spec_dbc.pdf
+Hunter,MP Rotator,Rotary (multi-stream),MP3500,180,40,35,2.86,,,0.45,No 360 model in this family (max arc 210),Hunter_MPRotator_Spec_dbc.pdf
+Hunter,HDL Dripline,Drip/Micro,HDL-04 (0.4 GPH),,,,,0.40,12,,"Corroborated via product listings/distributor pages; hunterirrigation.com blocked automated PDF download for this doc",(not downloaded - see notes)
+Hunter,HDL Dripline,Drip/Micro,HDL-06 (0.6 GPH),,,,,0.60,12,,"Corroborated via product listings/distributor pages; hunterirrigation.com blocked automated PDF download for this doc",(not downloaded - see notes)
+Hunter,HDL Dripline,Drip/Micro,HDL-09 (0.9 GPH),,,,,0.90,12,,"Corroborated via product listings/distributor pages; hunterirrigation.com blocked automated PDF download for this doc",(not downloaded - see notes)
+Toro,MPR Plus,Spray (matched-precip fixed),5F,360,30,5,0.38,,,1.47,,Toro_MPRPlus_Spray_Nozzles_Catalog.pdf
+Toro,MPR Plus,Spray (matched-precip fixed),8F,360,30,8,1.00,,,1.51,,Toro_MPRPlus_Spray_Nozzles_Catalog.pdf
+Toro,MPR Plus,Spray (matched-precip fixed),10F,360,30,10,1.49,,,1.44,,Toro_MPRPlus_Spray_Nozzles_Catalog.pdf
+Toro,MPR Plus,Spray (matched-precip fixed),12F,360,30,12,2.19,,,1.47,,Toro_MPRPlus_Spray_Nozzles_Catalog.pdf
+Toro,MPR Plus,Spray (matched-precip fixed),15F,360,30,15,3.60,,,1.55,,Toro_MPRPlus_Spray_Nozzles_Catalog.pdf
+Toro,T5 Series,Rotor,Standard Angle (25 deg) set,,45,33-50,1.15-9.70,,,0.20-0.86,"Range-level bid-spec data only, not a per-nozzle pressure table like other rows",Toro_T5_Series_Rotor_BidSpec.pdf
+Toro,T5 Series,Rotor,Low Angle (10 deg) set,,45,25-36,0.74-3.70,,,0.20-0.86,"Range-level bid-spec data only, not a per-nozzle pressure table like other rows",Toro_T5_Series_Rotor_BidSpec.pdf
+Toro,Precision Series (PRN),Rotary (multi-stream),PRN-TA/TF,360,40,20.9,2.56,,,0.65,"Table has no 45 psi row (recommended); closest tested pressure (40 psi) shown",Toro_Precision_Rotating_Nozzles_Spec_dbc.pdf
+Toro,Drip In PC,Drip/Micro,PCB-2xx (0.58 GPH),,,,,0.58,12,,Pressure-compensating at-grade dripline,Toro_DripIn_PC_Dripline_Design_Guide.pdf
+Toro,Drip In PC,Drip/Micro,PCB-4xx (0.92 GPH),,,,,0.92,12,,Pressure-compensating at-grade dripline,Toro_DripIn_PC_Dripline_Design_Guide.pdf
+Toro,DL2000,Drip/Micro,RGP-2xx (0.5 GPH),,,,,0.50,12,,Pressure-compensating below-grade dripline,Toro_DripIn_PC_Dripline_Design_Guide.pdf
+Toro,DL2000,Drip/Micro,RGP-4xx (1.0 GPH),,,,,1.00,12,,Pressure-compensating below-grade dripline,Toro_DripIn_PC_Dripline_Design_Guide.pdf
+Orbit,Adjustable Pattern,Spray (fixed/adjustable arc),53580L (4ft),360,30,4,1.92,,,11.55,"Consumer/DIY-grade line; notably higher flow per radius than pro-grade equivalents",Orbit_Adjustable_Spray_Nozzles_Spec.pdf
+Orbit,Adjustable Pattern,Spray (fixed/adjustable arc),53581L (8ft),360,30,9,2.60,,,3.09,,Orbit_Adjustable_Spray_Nozzles_Spec.pdf
+Orbit,Adjustable Pattern,Spray (fixed/adjustable arc),53582 (10ft),360,30,10,2.66,,,2.56,,Orbit_Adjustable_Spray_Nozzles_Spec.pdf
+Orbit,Adjustable Pattern,Spray (fixed/adjustable arc),53583L (12ft),360,30,13,2.82,,,1.61,,Orbit_Adjustable_Spray_Nozzles_Spec.pdf
+Orbit,Adjustable Pattern,Spray (fixed/adjustable arc),53584L (15ft),360,30,16,3.12,,,1.17,,Orbit_Adjustable_Spray_Nozzles_Spec.pdf
+Orbit,Adjustable Pattern,Spray (fixed/adjustable arc),53585 (18ft),360,30,18,3.30,,,0.98,,Orbit_Adjustable_Spray_Nozzles_Spec.pdf
+Orbit,Voyager II,Rotor,1.0 GPM Standard,,40,35,1.0,,,,"Summary spec only (search-corroborated); no full per-pressure table sourced",(not downloaded - see notes)
+Orbit,Voyager II,Rotor,3.0 GPM Standard (factory default),,40,35,3.0,,,0.24,"Factory pre-installed default nozzle; summary spec only",(not downloaded - see notes)
+Orbit,Voyager II,Rotor,4.0 GPM Standard,,40,35,4.0,,,,"Summary spec only (search-corroborated); no full per-pressure table sourced",(not downloaded - see notes)
+Orbit,Voyager II,Rotor,8.0 GPM Pasture,,40,35,8.0,,,,"Large-area nozzle; summary spec only",(not downloaded - see notes)
+Orbit,-,Rotary (multi-stream),N/A,,,,,,,,"Orbit does not appear to manufacture a dedicated matched-precipitation multi-stream rotary nozzle line (like MP Rotator/R-VAN/PRN); their adjustable sprays are explicitly cross-compatible with Rain Bird/Hunter bodies instead",N/A
+Orbit,Drip Emitters,Drip/Micro,0.5 GPH button emitter,,,,,0.50,installer-determined,,"Point-source emitter punched into 1/4in or 1/2in tubing, not factory-spaced dripline",(not downloaded - see notes)
+Orbit,Drip Emitters,Drip/Micro,1.0 GPH button emitter,,,,,1.00,installer-determined,,"Point-source emitter punched into 1/4in or 1/2in tubing, not factory-spaced dripline",(not downloaded - see notes)
+Orbit,Drip Emitters,Drip/Micro,2.0 GPH button emitter,,,,,2.00,installer-determined,,"Point-source emitter punched into 1/4in or 1/2in tubing, not factory-spaced dripline",(not downloaded - see notes)
+Orbit,Drip Emitters,Drip/Micro,4.0 GPH button emitter,,,,,4.00,installer-determined,,"Point-source emitter punched into 1/4in or 1/2in tubing, not factory-spaced dripline",(not downloaded - see notes)
