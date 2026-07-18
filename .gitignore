@@ -13,3 +13,7 @@ Backups/
 .streamlit/
 .streamlit/secrets.toml
 
+*.sqlite
+
+# Local run logs
+*.log

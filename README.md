@@ -1,4 +1,4 @@
-# 🌱 Irrigation Dashboard v0.35
+# 🌱 Irrigation Dashboard v0.36
 
 Irrigation Dashboard is a localized, web-based Evapotranspiration (ET) application that helps you manage lawn and garden watering with precision. By pulling real-time weather data and calculating soil moisture depletion, it tells you exactly **when** to water and **how much** to apply.
 
@@ -59,6 +59,14 @@ If you wish to host the dashboard locally on your machine instead of using the w
 2. **Environment:** Ensure you have [Anaconda](https://www.anaconda.com/) or Python 3.10+ installed.
 3. **Launch:** Double-click the `Run_Irrigation.bat` file to automatically install libraries and open the system on `localhost`.
 4. **Local Directory Button:** When running locally on Windows, an extra button appears in the **Data Security** tab allowing you to jump directly to your data folder via Windows File Explorer.
+
+### Running Locally Against the Shared Cloud Database
+
+By default, a local run falls back to local JSON storage. To instead point a local run at the same Supabase/Postgres database used by the hosted deployment (useful for testing with real shared data):
+
+1. Copy `streamlit_secrets.example.toml` to `.streamlit/secrets.toml` in the project root (this path is gitignored and will never be committed).
+2. Fill in the `[connections.postgresql]` URL from your Supabase project (**Project Settings → Database → Connection string**), plus the `[supabase]` block if desired.
+3. Launch the app as usual. The sidebar shows the live connection status: "☁️ Cloud sync active" when connected to Postgres, or "💾 Local-only mode" if it fell back to local JSON.
 
 ---
 *Developed for smart water management and healthy landscapes.*

@@ -4,10 +4,11 @@ import requests
 import requests_cache
 import platform
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import altair as alt
 import streamlit as st
+from streamlit_option_menu import option_menu
 from sqlalchemy import text
 from retry_requests import retry
 import openmeteo_requests
@@ -47,6 +48,7 @@ class MockConnection:
     session = MockSession()
 
 # 0.1 Setup Database Connection (Fallback to Streamlit SQL Connection)
+DB_CONNECTION_ERROR = None
 try:
     conn = st.connection("postgresql", type="sql")
     # Initialize shared cloud tables in Postgres if database is online
@@ -90,11 +92,42 @@ try:
                     inches NUMERIC NOT NULL
                 );
             """))
+            # Shared weather cache: one row per location/day, reused across every user and
+            # zone at that location so a single Open-Meteo fetch serves everyone, and so the
+            # archive survives Streamlit Cloud container reboots (unlike the local JSON/
+            # in-memory caches, which are wiped on every reboot).
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS weather_cache (
+                    lat NUMERIC NOT NULL,
+                    lon NUMERIC NOT NULL,
+                    log_date DATE NOT NULL,
+                    et0_in NUMERIC NOT NULL,
+                    rain_in NUMERIC NOT NULL,
+                    PRIMARY KEY (lat, lon, log_date)
+                );
+            """))
+            session.execute(text("""
+                CREATE TABLE IF NOT EXISTS weather_fetch_meta (
+                    lat NUMERIC NOT NULL,
+                    lon NUMERIC NOT NULL,
+                    last_fetch_utc TIMESTAMP NOT NULL,
+                    PRIMARY KEY (lat, lon)
+                );
+            """))
             session.commit()
-    except Exception:
-        pass
-except Exception:
+    except Exception as e:
+        DB_CONNECTION_ERROR = f"Connected, but table setup failed: {e}"
+except Exception as e:
     conn = MockConnection()
+    DB_CONNECTION_ERROR = str(e)
+
+# Visible, trustworthy connection status (previously the only indicator in the app checked
+# whether Supabase REST secrets were present, not whether the Postgres connection actually
+# worked -- so it could read "connected" while silently running on the local JSON fallback).
+if isinstance(conn, MockConnection):
+    st.sidebar.caption(f"\U0001F4BE Local-only mode (DB not connected){': ' + DB_CONNECTION_ERROR if DB_CONNECTION_ERROR else ''}")
+else:
+    st.sidebar.caption("☁️ Cloud sync active")
 
 # 0.2 User DB Authentication Helpers
 def db_register_user(username, password):
@@ -345,6 +378,35 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==============================================================================
+# TOP NAVIGATION HEADER (section tabs + profile menu)
+# ==============================================================================
+nav_col, profile_col = st.columns([6, 1])
+
+with nav_col:
+    selected_tab = option_menu(
+        menu_title=None,
+        options=["Dashboard", "Properties", "Ledger", "Reference"],
+        icons=["speedometer2", "houses", "table", "book"],
+        menu_icon="cast",
+        default_index=0,
+        orientation="horizontal",
+    )
+
+with profile_col:
+    st.write("")
+    with st.popover(f"👤 {st.session_state.username}"):
+        st.markdown(f"**Logged in as:** {st.session_state.username}")
+        mode_label = "💾 Local-only" if isinstance(conn, MockConnection) else "☁️ Cloud sync"
+        st.caption(f"Connection: {mode_label}")
+        st.divider()
+        if st.button("🚪 Log Out", use_container_width=True, key="profile_logout_btn"):
+            st.session_state.authenticated = False
+            st.session_state.username = None
+            st.session_state.user_id = "default_user"
+            st.session_state.active_prop = None
+            st.rerun()
+
+# ==============================================================================
 # PROPERTY CONFIGURATION & SESSION STATE (Authenticated User)
 # ==============================================================================
 user_paths = data_manager.get_user_paths(st.session_state.user_id)
@@ -353,7 +415,7 @@ PROP_LIST_FILE = user_paths["prop_list"]
 properties_dict = load_properties_from_cloud() or data_manager.load_json(PROP_LIST_FILE, {})
 
 # Render Property Selector in Sidebar
-st.sidebar.header("🏠 Property Settings")
+st.sidebar.header("🏠 Active Property")
 prop_options = list(properties_dict.keys())
 
 # If the user has no properties, force them to create one
@@ -373,14 +435,6 @@ if not prop_options:
             st.rerun()
         else:
             st.sidebar.error("Please enter a valid name and zip code.")
-    
-    st.sidebar.divider()
-    if st.sidebar.button("🚪 Log Out", use_container_width=True):
-        st.session_state.authenticated = False
-        st.session_state.username = None
-        st.session_state.user_id = "default_user"
-        st.session_state.active_prop = None
-        st.rerun()
     st.stop()
 
 if "active_prop" not in st.session_state or st.session_state.active_prop not in prop_options:
@@ -389,32 +443,42 @@ if "active_prop" not in st.session_state or st.session_state.active_prop not in 
 active_prop = st.sidebar.selectbox("Select Active Property", prop_options, index=prop_options.index(st.session_state.active_prop))
 st.session_state.active_prop = active_prop
 active_zip = properties_dict[active_prop]
+st.sidebar.caption("Manage or add properties from the 🏡 Properties tab above.")
 
-# Expandable area to add a new property
-with st.sidebar.expander("➕ Add New Property"):
-    new_prop_name = st.text_input("Property Name", key="new_prop_name_input")
-    new_prop_zip = st.text_input("Zip Code", key="new_prop_zip_input")
-    if st.button("Save Property", use_container_width=True):
-        if new_prop_name.strip() and new_prop_zip.strip():
-            p_name = new_prop_name.strip()
-            p_zip = new_prop_zip.strip()
-            if p_name not in properties_dict:
-                properties_dict[p_name] = p_zip
-                data_manager.save_json(PROP_LIST_FILE, properties_dict)
-                save_property_to_cloud(p_name, p_zip)
-                st.session_state.active_prop = p_name
-                st.toast(f"🏡 Property '{p_name}' added!")
-                st.rerun()
+# ==============================================================================
+# PROPERTIES TAB CONTENT (list + add new property)
+# ==============================================================================
+if selected_tab == "Properties":
+    st.header("🏡 Your Properties")
+    st.caption("Manage the properties on your account. Pick which one is active from the sidebar.")
+
+    prop_table = pd.DataFrame(
+        [{"Property": name, "Zip Code": zip_code, "Active": "✅" if name == active_prop else ""}
+         for name, zip_code in properties_dict.items()]
+    )
+    st.dataframe(prop_table, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("➕ Add New Property")
+    with st.form("add_property_form", clear_on_submit=True):
+        new_prop_name = st.text_input("Property Name", key="new_prop_name_input")
+        new_prop_zip = st.text_input("Zip Code", key="new_prop_zip_input")
+        submitted = st.form_submit_button("Save Property", use_container_width=True)
+        if submitted:
+            if new_prop_name.strip() and new_prop_zip.strip():
+                p_name = new_prop_name.strip()
+                p_zip = new_prop_zip.strip()
+                if p_name not in properties_dict:
+                    properties_dict[p_name] = p_zip
+                    data_manager.save_json(PROP_LIST_FILE, properties_dict)
+                    save_property_to_cloud(p_name, p_zip)
+                    st.session_state.active_prop = p_name
+                    st.toast(f"🏡 Property '{p_name}' added!")
+                    st.rerun()
+                else:
+                    st.error("A property with that name already exists.")
             else:
-                st.error("A property with that name already exists.")
-
-# Logout button
-if st.sidebar.button("🚪 Log Out", use_container_width=True):
-    st.session_state.authenticated = False
-    st.session_state.username = None
-    st.session_state.user_id = "default_user"
-    st.session_state.active_prop = None
-    st.rerun()
+                st.error("Please enter a valid name and zip code.")
 
 # Dynamic path resolution based on active property and user
 paths = data_manager.get_prop_paths_for_user(st.session_state.user_id, active_prop)
@@ -613,23 +677,117 @@ def save_log(zone, minutes, inches_applied):
     })
     data_manager.save_json(LOG_FILE, local_logs)
 
-    st.cache_data.clear()
+
+# 1.2b Shared Cloud Weather Cache (rounded lat/lon so every user/zone at the same
+# location reuses one fetch, and history survives Streamlit Cloud container reboots)
+def _weather_coord_key(lat, lon):
+    return round(float(lat), 2), round(float(lon), 2)
+
+
+def load_weather_cache_from_cloud(lat, lon):
+    if isinstance(conn, MockConnection):
+        return None
+    coord_lat, coord_lon = _weather_coord_key(lat, lon)
+    try:
+        df = conn.query(
+            """
+                SELECT log_date AS time, et0_in AS "ET0 (in)", rain_in AS "Rain (in)"
+                FROM weather_cache WHERE lat = :lat AND lon = :lon
+            """,
+            params={"lat": coord_lat, "lon": coord_lon},
+            ttl=0,
+        )
+        return df
+    except Exception:
+        return None
+
+
+def save_weather_cache_to_cloud(lat, lon, df_daily):
+    if isinstance(conn, MockConnection):
+        return
+    coord_lat, coord_lon = _weather_coord_key(lat, lon)
+    try:
+        with conn.session as session:
+            # Store forecast rows too (not just history) -- the reboot-proof fetch gate can
+            # skip real fetches for up to 20h, so the archive needs to double as the source
+            # for the forward-looking forecast view during that window. Forecast values get
+            # naturally overwritten with actuals once a later real fetch covers that date.
+            for _, row in df_daily.iterrows():
+                session.execute(text("""
+                    INSERT INTO weather_cache (lat, lon, log_date, et0_in, rain_in)
+                    VALUES (:lat, :lon, :log_date, :et0, :rain)
+                    ON CONFLICT (lat, lon, log_date)
+                    DO UPDATE SET et0_in = EXCLUDED.et0_in, rain_in = EXCLUDED.rain_in;
+                """), {
+                    "lat": coord_lat, "lon": coord_lon,
+                    "log_date": row['time'].date(),
+                    "et0": float(row["ET0 (in)"]), "rain": float(row["Rain (in)"]),
+                })
+            session.commit()
+    except Exception:
+        pass
+
+
+def get_weather_last_fetch(lat, lon):
+    """Returns the UTC datetime weather was last actually fetched from Open-Meteo for this
+    location (cloud table if connected, else the local JSON metadata key), or None."""
+    if not isinstance(conn, MockConnection):
+        coord_lat, coord_lon = _weather_coord_key(lat, lon)
+        try:
+            df = conn.query(
+                "SELECT last_fetch_utc FROM weather_fetch_meta WHERE lat = :lat AND lon = :lon",
+                params={"lat": coord_lat, "lon": coord_lon},
+                ttl=0,
+            )
+            if not df.empty:
+                return pd.to_datetime(df.iloc[0]["last_fetch_utc"]).to_pydatetime().replace(tzinfo=None)
+        except Exception:
+            pass
+    meta = data_manager.load_json(WEATHER_LOG, {})
+    ts = meta.get("__last_fetch_utc")
+    return pd.to_datetime(ts).to_pydatetime().replace(tzinfo=None) if ts else None
+
+
+def mark_weather_fetched_cloud(lat, lon, fetched_at):
+    if isinstance(conn, MockConnection):
+        return
+    coord_lat, coord_lon = _weather_coord_key(lat, lon)
+    try:
+        with conn.session as session:
+            session.execute(text("""
+                INSERT INTO weather_fetch_meta (lat, lon, last_fetch_utc)
+                VALUES (:lat, :lon, :ts)
+                ON CONFLICT (lat, lon) DO UPDATE SET last_fetch_utc = EXCLUDED.last_fetch_utc;
+            """), {"lat": coord_lat, "lon": coord_lon, "ts": fetched_at})
+            session.commit()
+    except Exception:
+        pass
 
 
 # 1.3 Archive Weather to Local Storage Cache
-def archive_weather(df_daily):
-    """Stores historical daily ET and Rainfall records in a local JSON structure."""
+def archive_weather(df_daily, lat, lon):
+    """Stores historical daily ET and Rainfall records locally and (when connected) in the
+    shared cloud weather cache, and stamps the last-fetch time so the durable reboot-proof
+    gate at the call site knows not to re-fetch too soon."""
     history = data_manager.load_json(WEATHER_LOG, {})
     for _, row in df_daily.iterrows():
         date_str = row['time'].strftime('%Y-%m-%d')
-        if row['time'].date() <= datetime.now().date():
-            history[date_str] = {"ET0 (in)": row["ET0 (in)"], "Rain (in)": row["Rain (in)"]}
+        history[date_str] = {"ET0 (in)": row["ET0 (in)"], "Rain (in)": row["Rain (in)"]}
+    fetched_at = datetime.utcnow()
+    history["__last_fetch_utc"] = fetched_at.isoformat()
     data_manager.save_json(WEATHER_LOG, history)
+    save_weather_cache_to_cloud(lat, lon, df_daily)
+    mark_weather_fetched_cloud(lat, lon, fetched_at)
 
 
 # 1.4 Load Archived Weather History
-def load_weather_history():
-    """Loads archived local weather logs and transforms into a DataFrame."""
+def load_weather_history(lat, lon):
+    """Loads archived weather history, preferring the shared cloud cache (durable across
+    Streamlit Cloud reboots) and falling back to the local JSON archive."""
+    cloud_df = load_weather_cache_from_cloud(lat, lon)
+    if cloud_df is not None and not cloud_df.empty:
+        cloud_df['time'] = pd.to_datetime(cloud_df['time'])
+        return cloud_df
     data = data_manager.load_json(WEATHER_LOG, {})
     if data:
         # Exclude reserved metadata keys (e.g. rate-limit timestamp)
@@ -646,13 +804,6 @@ def load_weather_history():
 # ==============================================================================
 # 2. APPLICATION INITIALIZATION
 # ==============================================================================
-
-mode_label = "☁️ Cloud sync active" if SUPABASE_READY else "💾 Local-only mode"
-st.markdown(
-    f"<div style='padding:8px 12px; background:#f0f2f6; border-radius:8px; margin-bottom:12px;'>"
-    f"<strong>Irrigation Dashboard</strong> — <span>{mode_label}</span> — <em>v0.35</em></div>",
-    unsafe_allow_html=True,
-)
 
 # 2.1 Load Local App Profiles
 profiles = load_profiles()
@@ -789,7 +940,6 @@ with zone_col2:
                 profiles.pop(active_zone_name)
             
             save_profiles(profiles)
-            st.cache_data.clear()
             st.toast(f"💥 Wiped {active_zone_name} from dashboard configuration profile.")
             st.rerun()
 
@@ -924,41 +1074,16 @@ aw_capacity_inft = (fc_raw - pwp_raw) * 12
 # ==============================================================================
 
 # 7.1 Setup API Sessions
-cache_session = requests_cache.CachedSession('.cache', expire_after=300)
+# Keep the request cache warm for a full day so the dashboard reuses the same weather payload
+# instead of creating a fresh Open-Meteo request for every rerun or log action.
+cache_session = requests_cache.CachedSession('.cache', expire_after=86400)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
 
 
 # 7.2 Core Integrated Fetching Routine
-# Rate-limit key stored inside the weather JSON under a reserved "__last_fetch__" key.
-API_COOLDOWN_SECONDS = 300  # 5 minutes
-
-def _is_api_cooldown_active(weather_log_path):
-    """Returns True if the last successful API call was less than API_COOLDOWN_SECONDS ago."""
-    meta = data_manager.load_json(weather_log_path, {})
-    last_fetch_str = meta.get("__last_fetch__")
-    if last_fetch_str:
-        try:
-            last_fetch = datetime.fromisoformat(last_fetch_str)
-            elapsed = (datetime.now() - last_fetch).total_seconds()
-            return elapsed < API_COOLDOWN_SECONDS
-        except Exception:
-            pass
-    return False
-
-def _record_api_fetch(weather_log_path):
-    """Stamps the current timestamp into the weather JSON so cooldown persists across restarts."""
-    meta = data_manager.load_json(weather_log_path, {})
-    meta["__last_fetch__"] = datetime.now().isoformat()
-    data_manager.save_json(weather_log_path, meta)
-
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400)
 def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
-    # --- Persistent rate-limit guard ---
-    if _is_api_cooldown_active(weather_log_path):
-        # Return None so the caller falls back to locally archived data
-        return None
-
     start_dt = pd.to_datetime(start_date_str).date()
     today = datetime.now().date()
     days_back = (today - start_dt).days
@@ -983,12 +1108,18 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             "longitude": lon,
             "hourly": ["et0_fao_evapotranspiration", "precipitation"],
             "timezone": "auto",
-            "past_days": 92,
+            # Only request as many past days as the gap actually requires (capped at 92) --
+            # Open-Meteo bills a request as multiple "API calls" once its span passes 2 weeks,
+            # so requesting the full 92 every time (as this used to) was ~7-8x the quota cost
+            # of a normal daily top-up fetch.
+            "past_days": min(92, max(days_back, 1)),
             "forecast_days": 14
         }
         is_hourly = True
-        
+
     try:
+        print(f"[OpenMeteo] network fetch: lat={lat} lon={lon} url={url} "
+              f"span={params.get('past_days', (today - start_dt).days)}d+forecast start={start_dt} end={today}")
         responses = openmeteo.weather_api(url, params=params)
         response = responses[0]
         
@@ -1025,8 +1156,6 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             df_daily['time'] = df_daily['time'].dt.tz_convert(None)
             
         df_daily['time'] = df_daily['time'].dt.normalize()
-        # Record the successful fetch so the cooldown timer starts now
-        _record_api_fetch(weather_log_path)
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
         
     except Exception as e:
@@ -1035,14 +1164,44 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
 
 
 # 7.3 Weather Processing and Data Merger
-zone_start_date_str = current_zone.get("start_date", str(datetime.now().date() - pd.Timedelta(days=7)))
-df_api = fetch_weather_integrated(lat, lon, zone_start_date_str, WEATHER_LOG)
 
-# Always load the local archive as the base; merge fresh API data if available
-df_permanent = load_weather_history()
+# Always load the archive first (cloud cache if connected, else local JSON) -- this is what
+# actually backs the displayed history/forecast, so the live API only ever needs to fill in
+# what's missing from it.
+df_permanent = load_weather_history(lat, lon)
+
+zone_start_date = pd.to_datetime(
+    current_zone.get("start_date", str(datetime.now().date() - pd.Timedelta(days=7)))
+).date()
+
+# Base the "how far back is already covered" check only on archived history, not the forecast
+# rows also stored in the archive (their dates run into the future and would otherwise make
+# the gap look already closed).
+today_date = datetime.now().date()
+historical = df_permanent[pd.to_datetime(df_permanent['time']).dt.date <= today_date] if not df_permanent.empty else df_permanent
+
+if not historical.empty:
+    # Only ask Open-Meteo for a couple of days of overlap past what's already archived,
+    # instead of re-requesting the zone's entire history on every fetch.
+    overlap_start_date = (pd.to_datetime(historical['time']).max() - pd.Timedelta(days=2)).date()
+    effective_start_date = max(zone_start_date, overlap_start_date)
+else:
+    # No history archived yet for this location -- do the one-time full backfill from the zone's start date.
+    effective_start_date = zone_start_date
+
+# Durable gate: skip the network call entirely if this location was already fetched recently.
+# This lives in the DB/local-JSON (not st.cache_data or the requests_cache sqlite file), so it
+# still holds even after a Streamlit Cloud container reboot wipes those in-process caches.
+last_fetch = get_weather_last_fetch(lat, lon)
+needs_fetch = last_fetch is None or (datetime.utcnow() - last_fetch) > timedelta(hours=20)
+
+df_api = None
+if needs_fetch:
+    df_api = fetch_weather_integrated(lat, lon, str(effective_start_date), WEATHER_LOG)
+
 if df_api is not None:
-    archive_weather(df_api)
-    df_permanent = load_weather_history()  # reload after archiving
+    archive_weather(df_api, lat, lon)
+    df_permanent = load_weather_history(lat, lon)  # reload after archiving
     df_daily = pd.concat([df_permanent, df_api]).drop_duplicates(subset='time', keep='last').sort_values('time')
 elif not df_permanent.empty:
     df_daily = df_permanent.sort_values('time')
@@ -1098,375 +1257,380 @@ if df_api is not None or not df_permanent.empty:
 # ==============================================================================
 # 9. MAIN DASHBOARD METRICS
 # ==============================================================================
-    st.markdown(f"### {active_prop} : {active_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
-    st.divider()
-    
-    seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum() if len(df_forecast) >= 7 else df_forecast['ET0 (in)'].sum()
-    seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum() if len(df_forecast) >= 7 else df_forecast['Rain (in)'].sum()
-    
-    # Establish system recommendation warning boundaries
-    if current_deficit < ad_limit:
-        status_msg = "✋ Wait to Water"
-    else:
-        status_msg = "💧 Time to Water!"
-        
-    m1, m2, m3, m4 = st.columns(4)
-    
-    # Column A: Water to Apply
-    m1.metric(
-        label="Water to Apply", 
-        value=f"{current_deficit:.2f}\"",
-        help="The current root-zone moisture deficit relative to field capacity."
-    )
-    
-    # Column B: Allowable Depletion
-    m2.metric(
-        label="Allowable Depletion", 
-        value=f"{ad_limit:.2f}\"",
-        help="The maximum water allowed to deplete before plant health experiences crop stress."
-    )
-    
-    # Column C: Cumulative ET Forecast
-    m3.metric(
-        label="7-Day ET Forecast", 
-        value=f"{seven_day_et:.2f}\"",
-        help="Total atmospheric moisture loss modeled over the next week."
-    )
-    
-    # Column D: Cumulative Rain Forecast
-    m4.metric(
-        label="7-Day Rain Forecast", 
-        value=f"{seven_day_rain:.2f}\"",
-        help="Total precipitation expected over the next week."
-    )
-    
-    st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
-    st.divider()
-  
-    # Immediate Guidance Callouts
-    if seven_day_rain > current_deficit and current_deficit > 0:
-        st.warning(f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!")
-    elif current_deficit <= 0:
-        st.success(f"✅ **Soil is Hydrated!**")
-    else:
-        st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity.")
+    if selected_tab == "Dashboard":
+        st.markdown(f"### {active_prop} : {active_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
+        st.divider()
+
+        seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum() if len(df_forecast) >= 7 else df_forecast['ET0 (in)'].sum()
+        seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum() if len(df_forecast) >= 7 else df_forecast['Rain (in)'].sum()
+
+        # Establish system recommendation warning boundaries
+        if current_deficit < ad_limit:
+            status_msg = "✋ Wait to Water"
+        else:
+            status_msg = "💧 Time to Water!"
+
+        m1, m2, m3, m4 = st.columns(4)
+
+        # Column A: Water to Apply
+        m1.metric(
+            label="Water to Apply", 
+            value=f"{current_deficit:.2f}\"",
+            help="The current root-zone moisture deficit relative to field capacity."
+        )
+
+        # Column B: Allowable Depletion
+        m2.metric(
+            label="Allowable Depletion", 
+            value=f"{ad_limit:.2f}\"",
+            help="The maximum water allowed to deplete before plant health experiences crop stress."
+        )
+
+        # Column C: Cumulative ET Forecast
+        m3.metric(
+            label="7-Day ET Forecast", 
+            value=f"{seven_day_et:.2f}\"",
+            help="Total atmospheric moisture loss modeled over the next week."
+        )
+
+        # Column D: Cumulative Rain Forecast
+        m4.metric(
+            label="7-Day Rain Forecast", 
+            value=f"{seven_day_rain:.2f}\"",
+            help="Total precipitation expected over the next week."
+        )
+
+        st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
+        st.divider()
+
+        # Immediate Guidance Callouts
+        if seven_day_rain > current_deficit and current_deficit > 0:
+            st.warning(f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!")
+        elif current_deficit <= 0:
+            st.success(f"✅ **Soil is Hydrated!**")
+        else:
+            st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity.")
 
 
 # ==============================================================================
 # 10. VISUAL ANALYTICS & TABLES
 # ==============================================================================
-st.divider()
-with st.expander("📈 View Water Balance Graph", expanded=True):
-    st.write(f"### 📈 Water Balance for {active_zone_name}")
+if selected_tab == "Dashboard":
+    st.divider()
+    with st.expander("📈 View Water Balance Graph", expanded=True):
+        st.write(f"### 📈 Water Balance for {active_zone_name}")
 
-    if not df_daily.empty:
-        now_dt = pd.Timestamp(datetime.now().date()).normalize()
-        
-        # Configure Default View Zoom Bounds
-        view_start = now_dt - pd.Timedelta(days=7)
-        view_end = now_dt + pd.Timedelta(days=14)
-        lookback_days = 180  
-        data_start = now_dt - pd.Timedelta(days=lookback_days)
-        df_zoom = df_daily[df_daily['time'] >= data_start].copy()
-        
-        # Define Unified Interactive X-Axis Scale
-        x_axis = alt.X('time:T', 
-                       title='Date', 
-                       scale=alt.Scale(domain=[view_start.strftime('%Y-%m-%d'), view_end.strftime('%Y-%m-%d')]),
-                       axis=alt.Axis(format='%b %d'))
+        if not df_daily.empty:
+            now_dt = pd.Timestamp(datetime.now().date()).normalize()
 
-        # Chart Layer A: Evapotranspiration Line
-        et_chart = alt.Chart(df_zoom).mark_line(strokeWidth=3, color='#FF8C00').encode(
-            x=x_axis,
-            y=alt.Y('ET0 (in):Q', title='Inches'),
-            tooltip=['time:T', 'ET0 (in):Q']
-        )
+            # Configure Default View Zoom Bounds
+            view_start = now_dt - pd.Timedelta(days=7)
+            view_end = now_dt + pd.Timedelta(days=14)
+            lookback_days = 180  
+            data_start = now_dt - pd.Timedelta(days=lookback_days)
+            df_zoom = df_daily[df_daily['time'] >= data_start].copy()
 
-        # Chart Layer B: Rainfall Bars
-        rain_chart = alt.Chart(df_zoom).mark_bar(opacity=0.5, color='#ADD8E6').encode(
-            x=x_axis,
-            y='Rain (in):Q',
-            tooltip=['time:T', 'Rain (in):Q']
-        )
+            # Define Unified Interactive X-Axis Scale
+            x_axis = alt.X('time:T', 
+                           title='Date', 
+                           scale=alt.Scale(domain=[view_start.strftime('%Y-%m-%d'), view_end.strftime('%Y-%m-%d')]),
+                           axis=alt.Axis(format='%b %d'))
 
-        # Chart Layer C: Irrigation Events
-        irr_chart = alt.Chart(df_zoom).mark_bar(size=10, color='#003366').encode(
-            x=x_axis,
-            y='Irrigation (in):Q',
-            tooltip=['time:T', 'Irrigation (in):Q']
-        )
+            # Chart Layer A: Evapotranspiration Line
+            et_chart = alt.Chart(df_zoom).mark_line(strokeWidth=3, color='#FF8C00').encode(
+                x=x_axis,
+                y=alt.Y('ET0 (in):Q', title='Inches'),
+                tooltip=['time:T', 'ET0 (in):Q']
+            )
 
-        # Chart Layer D: Today Reference Marker
-        today_line = alt.Chart(pd.DataFrame({'time': [now_dt]})).mark_rule(
-            color='red', strokeDash=[5,5], strokeWidth=2
-        ).encode(x=x_axis)
+            # Chart Layer B: Rainfall Bars
+            rain_chart = alt.Chart(df_zoom).mark_bar(opacity=0.5, color='#ADD8E6').encode(
+                x=x_axis,
+                y='Rain (in):Q',
+                tooltip=['time:T', 'Rain (in):Q']
+            )
+
+            # Chart Layer C: Irrigation Events
+            irr_chart = alt.Chart(df_zoom).mark_bar(size=10, color='#003366').encode(
+                x=x_axis,
+                y='Irrigation (in):Q',
+                tooltip=['time:T', 'Irrigation (in):Q']
+            )
+
+            # Chart Layer D: Today Reference Marker
+            today_line = alt.Chart(pd.DataFrame({'time': [now_dt]})).mark_rule(
+                color='red', strokeDash=[5,5], strokeWidth=2
+            ).encode(x=x_axis)
 
 
-        # Combine, render, and freeze scale properties to prevent scrolling issues
-        final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
-            height=400
-        ).interactive(bind_y=False)
+            # Combine, render, and freeze scale properties to prevent scrolling issues
+            final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
+                height=400
+            ).interactive(bind_y=False)
 
-        st.altair_chart(final_chart, use_container_width=True)
+            st.altair_chart(final_chart, use_container_width=True)
 
-    # Centered Explanatory Key Legend
-    st.markdown("""
-    <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
-        <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
-        <div><span style="color:#ADD8E6; font-weight:bold;">▇</span> Rain (Gain)</div>
-        <div><span style="color:#003366; font-weight:bold;">▇</span> Irrigation (Gain)</div>
-        <div><span style="color:red; font-weight:bold;">---</span> Today</div>
-    </div>
-    """, unsafe_allow_html=True)
+        # Centered Explanatory Key Legend
+        st.markdown("""
+        <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
+            <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
+            <div><span style="color:#ADD8E6; font-weight:bold;">▇</span> Rain (Gain)</div>
+            <div><span style="color:#003366; font-weight:bold;">▇</span> Irrigation (Gain)</div>
+            <div><span style="color:red; font-weight:bold;">---</span> Today</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-# Forecast and Archive Tables View
-with st.expander("📋 View Forecast & History Tables", expanded=False):
-    tab1, tab2 = st.tabs(["🗓️ Forecast (Next 14 Days)", "📜 History (Past 90 Days)"])
-    with tab1:
-        st.dataframe(df_forecast.set_index("time").style.format("{:.2f}"), use_container_width=True)
-    with tab2:
-        st.dataframe(df_history.sort_values('time', ascending=False).set_index("time").style.format("{:.2f}"), use_container_width=True)
+    # Forecast and Archive Tables View
+    with st.expander("📋 View Forecast & History Tables", expanded=False):
+        tab1, tab2 = st.tabs(["🗓️ Forecast (Next 14 Days)", "📜 History (Past 90 Days)"])
+        with tab1:
+            st.dataframe(df_forecast.set_index("time").style.format("{:.2f}"), use_container_width=True)
+        with tab2:
+            st.dataframe(df_history.sort_values('time', ascending=False).set_index("time").style.format("{:.2f}"), use_container_width=True)
 
 
 # ==============================================================================
 # 11. GLOBAL WATER USAGE TRACKER & DATASET LEDGER
 # ==============================================================================
-st.divider()
-st.header("📈 Global Water Usage Tracker")
+if selected_tab == "Ledger":
+    st.divider()
+    st.header("📈 Global Water Usage Tracker")
 
-all_logs = load_logs()
+    all_logs = load_logs()
 
-if all_logs:
-    combined_data = []
-    for zone, events in all_logs.items():
-        z_prof = profiles.get(zone, profiles[list(profiles.keys())[0]])
-        z_area = z_prof.get("area", 1000)
-        z_flow = z_prof.get("flow", 5.0)
-        
-        for event in events:
-            mins = event.get("minutes", 0)
-            gallons_calc = mins * z_flow
-            combined_data.append({
-                "Date": event.get("date"),
-                "Zone": zone,
-                "Minutes": event.get("minutes", 0),
-                "Gallons": round(gallons_calc, 1),
-                "Inches": round(event.get("inches", 0), 3)
-            })
-    
-    usage_df = pd.DataFrame(combined_data)
-    
-    if not usage_df.empty:
-        usage_df["Date"] = pd.to_datetime(usage_df["Date"])
-        usage_df = usage_df.sort_values(by="Date", ascending=False)
-        total_gal = usage_df['Gallons'].sum()
-        total_inches = usage_df['Inches'].sum()
-        total_mins = usage_df['Minutes'].sum()
+    if all_logs:
+        combined_data = []
+        for zone, events in all_logs.items():
+            z_prof = profiles.get(zone, profiles[list(profiles.keys())[0]])
+            z_area = z_prof.get("area", 1000)
+            z_flow = z_prof.get("flow", 5.0)
 
-        # Render Totals Cards
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Events", len(usage_df))
-        col2.metric("Total Volume", f"{total_gal:,.0f} gal", help="Cumulative volume used across all zones.")
-        col3.metric("Total Depth", f"{total_inches:.2f}\"", help="Cumulative irrigation depth applied.")
-        col4.metric("Total Run Time", f"{total_mins:,.0f} min")
+            for event in events:
+                mins = event.get("minutes", 0)
+                gallons_calc = mins * z_flow
+                combined_data.append({
+                    "Date": event.get("date"),
+                    "Zone": zone,
+                    "Minutes": event.get("minutes", 0),
+                    "Gallons": round(gallons_calc, 1),
+                    "Inches": round(event.get("inches", 0), 3)
+                })
 
-        # Core Ledger Interactive Editor Setup
-        with st.expander("📂 View & Edit Full Irrigation Ledger", expanded=True):
-            st.caption("Editing **Minutes** or **Zone** will automatically recalculate **Inches** based on Zone parameters.")
-            
-            edited_df = st.data_editor(
-                usage_df,
-                column_config={
-                    "Inches": st.column_config.NumberColumn("Applied (in)", disabled=True, format="%.3f"),
-                    "Gallons": st.column_config.NumberColumn("Usage (gal)", disabled=True, format="%d"),
-                    "Minutes": st.column_config.NumberColumn("Minutes", min_value=0),
-                    "Zone": st.column_config.SelectboxColumn("Zone", options=list(profiles.keys())),
-                    "Date": st.column_config.DateColumn("Date")
-                },
-                num_rows="dynamic",
-                use_container_width=True,
-                key="global_master_editor"
-            )
+        usage_df = pd.DataFrame(combined_data)
 
-            # Execution Engine for Interactive Ledger Modifications
-            if not usage_df.equals(edited_df):
-                new_logs = {}
-                for _, row in edited_df.iterrows():
-                    if pd.isna(row["Date"]) or pd.isna(row["Zone"]):
-                        continue
-                    z_name = row["Zone"]
-                    mins = row["Minutes"]
-                    z_prof = profiles.get(z_name, profiles[list(profiles.keys())[0]])
-                    z_flow = z_prof.get("flow", 5.0)
-                    z_area = z_prof.get("area", 1000)
-                    
-                    calc_inches = (mins * z_flow) / (z_area * 0.623)
-                    
-                    if z_name not in new_logs:
-                        new_logs[z_name] = []
-                    
-                    date_val = row["Date"]
-                    date_str = str(date_val.date()) if hasattr(date_val, "date") else str(date_val)
-                    
-                    new_logs[z_name].append({
-                        "date": date_str,
-                        "minutes": mins,
-                        "inches": calc_inches
-                    })
-                    
-                if new_logs:
-                    data_manager.save_json(LOG_FILE, new_logs)
-                    st.success("Global logs updated and water depths recalculated!")
-                    st.rerun()
+        if not usage_df.empty:
+            usage_df["Date"] = pd.to_datetime(usage_df["Date"])
+            usage_df = usage_df.sort_values(by="Date", ascending=False)
+            total_gal = usage_df['Gallons'].sum()
+            total_inches = usage_df['Inches'].sum()
+            total_mins = usage_df['Minutes'].sum()
+
+            # Render Totals Cards
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Events", len(usage_df))
+            col2.metric("Total Volume", f"{total_gal:,.0f} gal", help="Cumulative volume used across all zones.")
+            col3.metric("Total Depth", f"{total_inches:.2f}\"", help="Cumulative irrigation depth applied.")
+            col4.metric("Total Run Time", f"{total_mins:,.0f} min")
+
+            # Core Ledger Interactive Editor Setup
+            with st.expander("📂 View & Edit Full Irrigation Ledger", expanded=True):
+                st.caption("Editing **Minutes** or **Zone** will automatically recalculate **Inches** based on Zone parameters.")
+
+                edited_df = st.data_editor(
+                    usage_df,
+                    column_config={
+                        "Inches": st.column_config.NumberColumn("Applied (in)", disabled=True, format="%.3f"),
+                        "Gallons": st.column_config.NumberColumn("Usage (gal)", disabled=True, format="%d"),
+                        "Minutes": st.column_config.NumberColumn("Minutes", min_value=0),
+                        "Zone": st.column_config.SelectboxColumn("Zone", options=list(profiles.keys())),
+                        "Date": st.column_config.DateColumn("Date")
+                    },
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key="global_master_editor"
+                )
+
+                # Execution Engine for Interactive Ledger Modifications
+                if not usage_df.equals(edited_df):
+                    new_logs = {}
+                    for _, row in edited_df.iterrows():
+                        if pd.isna(row["Date"]) or pd.isna(row["Zone"]):
+                            continue
+                        z_name = row["Zone"]
+                        mins = row["Minutes"]
+                        z_prof = profiles.get(z_name, profiles[list(profiles.keys())[0]])
+                        z_flow = z_prof.get("flow", 5.0)
+                        z_area = z_prof.get("area", 1000)
+
+                        calc_inches = (mins * z_flow) / (z_area * 0.623)
+
+                        if z_name not in new_logs:
+                            new_logs[z_name] = []
+
+                        date_val = row["Date"]
+                        date_str = str(date_val.date()) if hasattr(date_val, "date") else str(date_val)
+
+                        new_logs[z_name].append({
+                            "date": date_str,
+                            "minutes": mins,
+                            "inches": calc_inches
+                        })
+
+                    if new_logs:
+                        data_manager.save_json(LOG_FILE, new_logs)
+                        st.success("Global logs updated and water depths recalculated!")
+                        st.rerun()
 
 
-            # Global Volume Comparison chart
-            st.write("### 📊 Gallons Used per Zone")
-            zone_usage_gal = edited_df.groupby("Zone")["Gallons"].sum()
-            st.bar_chart(zone_usage_gal)
+                # Global Volume Comparison chart
+                st.write("### 📊 Gallons Used per Zone")
+                zone_usage_gal = edited_df.groupby("Zone")["Gallons"].sum()
+                st.bar_chart(zone_usage_gal)
+        else:
+            st.info("No data found in logs.")
     else:
-        st.info("No data found in logs.")
-else:
-    st.info("No watering events logged yet. Use the sidebar to log your first event!")
+        st.info("No watering events logged yet. Use the sidebar to log your first event!")
 
 
 # ==============================================================================
 # 12. SCIENCE REFERENCE LIBRARY
 # ==============================================================================
-st.divider()
-with st.expander("📚 Reference, Math & Science Methodology", expanded=False):
-    tab_audit, tab_calc, tab_science, tab_refs = st.tabs([
-        "📊 Soil Physics Logic", 
-        "🧮 Calculation Logic", 
-        "🔬 Weather Science",
-        "📚 References"
-    ])
-
-with tab_audit:
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.write("**Soil Constants**")
-        st.write(f"Field Capacity (FC): {fc_inft:.2f} in/ft")
-        st.write(f"Wilting Point (PWP): {pwp_inft:.2f} in/ft")
-        st.write(f"Available Water (AW): {aw_per_foot:.2f} in/ft") 
-    with col_b:
-        st.write("**Root Zone & Depletion**")
-        st.write(f"Root Zone (RZ): {rz_ft:.2f} ft ({depth_in} in)")
-        st.write(f"Plant Available Water (PAW): {paw_total:.2f} inches") 
-        st.write(f"Allowable Depletion (AD): {ad_limit:.2f} inches") 
-        
+if selected_tab == "Reference":
     st.divider()
-    depletion_status = (current_deficit / ad_limit) * 100 if ad_limit > 0 else 0
-    st.info(f"**Current Status:** Your deficit is {current_deficit:.2f}\". This represents {depletion_status:.1f}% of your Allowable Depletion limit.")
+    with st.expander("📚 Reference, Math & Science Methodology", expanded=False):
+        tab_audit, tab_calc, tab_science, tab_refs = st.tabs([
+            "📊 Soil Physics Logic", 
+            "🧮 Calculation Logic", 
+            "🔬 Weather Science",
+            "📚 References"
+        ])
 
-with tab_calc:
-    st.write(f"### Soil Profile: {soil_choice}")
-    st.info("💡 **How we calculate your 'Soil Tank' capacity:**")
-    st.latex(r"AW = FC - PWP")
-    st.caption(f"Available Water: {fc_inft/12:.3f} - {pwp_inft/12:.3f} = **{aw_per_foot/12:.3f} in/in**")
-    st.latex(r"PAW = AW \times RZ")
-    st.caption(f"Plant Available Water: {aw_per_foot:.2f} in/ft × {rz_ft:.2f} ft = **{paw_total:.2f} inches**")
-    st.latex(r"AD = PAW \times MAD")
-    st.caption(f"Allowable Depletion: {paw_total:.2f} in × {mad/100:.2f} = **{ad_limit:.2f} inches**")
-    st.divider()
-    
-    st.table(pd.DataFrame({
-        "Parameter": ["AWC (Soil Capacity)", "Root Depth", "Total Tank Size (PAW)", "MAD (Buffer)", "Allowable Depletion (AD)"],
-        "Value": [f"{(aw_per_foot/12):.3f} in/in", f"{depth_in} in", f"{paw_total:.2f} in", f"{mad}%", f"{ad_limit:.2f} in"]
-    }))
-    st.divider()
-    st.write("### Volume & Runtime Logic")
-    st.markdown(f"""
-    1. **Net Depth Needed:** **{current_deficit:.3f}"**
-    2. **Water Volume:** {current_deficit:.3f}" × {area} sq ft × 0.623 = **{gallons:.1f} Gallons**
-    3. **Runtime:** {gallons:.1f} gal / {flow} GPM = **{runtime:.1f} Minutes**
-    """)
+    with tab_audit:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.write("**Soil Constants**")
+            st.write(f"Field Capacity (FC): {fc_inft:.2f} in/ft")
+            st.write(f"Wilting Point (PWP): {pwp_inft:.2f} in/ft")
+            st.write(f"Available Water (AW): {aw_per_foot:.2f} in/ft") 
+        with col_b:
+            st.write("**Root Zone & Depletion**")
+            st.write(f"Root Zone (RZ): {rz_ft:.2f} ft ({depth_in} in)")
+            st.write(f"Plant Available Water (PAW): {paw_total:.2f} inches") 
+            st.write(f"Allowable Depletion (AD): {ad_limit:.2f} inches") 
 
-with tab_science:
-    st.write("### Evapotranspiration (ET₀) Explained")
-    st.markdown("""
-    The water loss value is calculated using reference **ET₀** parameters mapped back to the standard **FAO-56 Penman-Monteith Equation**.
-    
-    **Environmental Inputs Tracked:**
-    1. **Solar Radiation:** Primary thermodynamic energy engine.
-    2. **Ambient Temp:** Temperature gradients driving pressure.
-    3. **Relative Humidity:** Dry atmospheric vapor pressure gradients.
-    4. **Wind Speed:** Boundary layer transport factors.
-    """)
-    st.info("Data Source: High-resolution Open-Meteo meteorological API.")
-    
-with tab_refs:
-    st.write("### References")
-    st.markdown("""
-    **Reference A: Estimating Soil Physics Limits**
-    * Saxton, Keith S., and Walter J. Rawls. 'Estimating Soil Water Characteristics from Texture, Organic Matter, and Salinity.' *Soil Science Society of America Journal*, vol. 70, no. 5, 2006, pp. 1569-1578.
-    
-    **Reference B: Reference Crop ET Evaluations**
-    * Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
-    """)
+        st.divider()
+        depletion_status = (current_deficit / ad_limit) * 100 if ad_limit > 0 else 0
+        st.info(f"**Current Status:** Your deficit is {current_deficit:.2f}\". This represents {depletion_status:.1f}% of your Allowable Depletion limit.")
+
+    with tab_calc:
+        st.write(f"### Soil Profile: {soil_choice}")
+        st.info("💡 **How we calculate your 'Soil Tank' capacity:**")
+        st.latex(r"AW = FC - PWP")
+        st.caption(f"Available Water: {fc_inft/12:.3f} - {pwp_inft/12:.3f} = **{aw_per_foot/12:.3f} in/in**")
+        st.latex(r"PAW = AW \times RZ")
+        st.caption(f"Plant Available Water: {aw_per_foot:.2f} in/ft × {rz_ft:.2f} ft = **{paw_total:.2f} inches**")
+        st.latex(r"AD = PAW \times MAD")
+        st.caption(f"Allowable Depletion: {paw_total:.2f} in × {mad/100:.2f} = **{ad_limit:.2f} inches**")
+        st.divider()
+
+        st.table(pd.DataFrame({
+            "Parameter": ["AWC (Soil Capacity)", "Root Depth", "Total Tank Size (PAW)", "MAD (Buffer)", "Allowable Depletion (AD)"],
+            "Value": [f"{(aw_per_foot/12):.3f} in/in", f"{depth_in} in", f"{paw_total:.2f} in", f"{mad}%", f"{ad_limit:.2f} in"]
+        }))
+        st.divider()
+        st.write("### Volume & Runtime Logic")
+        st.markdown(f"""
+        1. **Net Depth Needed:** **{current_deficit:.3f}"**
+        2. **Water Volume:** {current_deficit:.3f}" × {area} sq ft × 0.623 = **{gallons:.1f} Gallons**
+        3. **Runtime:** {gallons:.1f} gal / {flow} GPM = **{runtime:.1f} Minutes**
+        """)
+
+    with tab_science:
+        st.write("### Evapotranspiration (ET₀) Explained")
+        st.markdown("""
+        The water loss value is calculated using reference **ET₀** parameters mapped back to the standard **FAO-56 Penman-Monteith Equation**.
+
+        **Environmental Inputs Tracked:**
+        1. **Solar Radiation:** Primary thermodynamic energy engine.
+        2. **Ambient Temp:** Temperature gradients driving pressure.
+        3. **Relative Humidity:** Dry atmospheric vapor pressure gradients.
+        4. **Wind Speed:** Boundary layer transport factors.
+        """)
+        st.info("Data Source: High-resolution Open-Meteo meteorological API.")
+
+    with tab_refs:
+        st.write("### References")
+        st.markdown("""
+        **Reference A: Estimating Soil Physics Limits**
+        * Saxton, Keith S., and Walter J. Rawls. 'Estimating Soil Water Characteristics from Texture, Organic Matter, and Salinity.' *Soil Science Society of America Journal*, vol. 70, no. 5, 2006, pp. 1569-1578.
+
+        **Reference B: Reference Crop ET Evaluations**
+        * Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
+        """)
 
 
 # ==============================================================================
 # 13. SYSTEM SECURITY & BACKUP UTILITIES
 # ==============================================================================
-st.divider()
-with st.expander("🛡️ Data Security & Backups"):
-    st.write("### 📥 Download App Data")
-    st.caption("Export active profiles and logging archives safely to disk.")
-    
-    profiles_string = json.dumps(profiles, indent=4)
-    all_logs = load_logs()
-    logs_string = json.dumps(all_logs, indent=4)
-    
-    dl_col1, dl_col2 = st.columns(2)
-    with dl_col1:
-        st.download_button(
-            label="📥 Download Zone Profiles",
-            data=profiles_string,
-            file_name=f"{active_prop}_profiles.json",
-            mime="application/json",
-            use_container_width=True
-        )
-    with dl_col2:
-        st.download_button(
-            label="📥 Download Watering Logs",
-            data=logs_string,
-            file_name=f"{active_prop}_history_log.json",
-            mime="application/json",
-            use_container_width=True
-        )
-
+if selected_tab == "Properties":
     st.divider()
-    st.write("### 🚀 Server System Backups")
-    st.write("Click below to build a timestamped configuration clone of directory assets.")
-    
-    if st.button("🚀 Create Instant Backup"):
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        current_backup_path = os.path.join(BACKUP_DIR, f"Backup_{timestamp}")
-        
-        try:
-            shutil.copytree(DATA_DIR, current_backup_path)
-            st.success(f"Backup Successful! Archive stored in local path: `{current_backup_path}`")
-            
-            # Show historical catalog
-            st.write("### Recent Backups on Disk:")
-            all_backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
-            for b in all_backups[:5]: 
-                st.text(f"📁 {b}")
-                
-        except Exception as e:
-            st.error(f"Backup failed: {e}")
+    with st.expander("🛡️ Data Security & Backups"):
+        st.write("### 📥 Download App Data")
+        st.caption("Export active profiles and logging archives safely to disk.")
 
-    st.caption("Note: Local platform checks protect standard container services. Secure physical directories systematically.")
+        profiles_string = json.dumps(profiles, indent=4)
+        all_logs = load_logs()
+        logs_string = json.dumps(all_logs, indent=4)
+
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            st.download_button(
+                label="📥 Download Zone Profiles",
+                data=profiles_string,
+                file_name=f"{active_prop}_profiles.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        with dl_col2:
+            st.download_button(
+                label="📥 Download Watering Logs",
+                data=logs_string,
+                file_name=f"{active_prop}_history_log.json",
+                mime="application/json",
+                use_container_width=True
+            )
+
+        st.divider()
+        st.write("### 🚀 Server System Backups")
+        st.write("Click below to build a timestamped configuration clone of directory assets.")
+
+        if st.button("🚀 Create Instant Backup"):
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+            current_backup_path = os.path.join(BACKUP_DIR, f"Backup_{timestamp}")
+
+            try:
+                shutil.copytree(DATA_DIR, current_backup_path)
+                st.success(f"Backup Successful! Archive stored in local path: `{current_backup_path}`")
+
+                # Show historical catalog
+                st.write("### Recent Backups on Disk:")
+                all_backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
+                for b in all_backups[:5]: 
+                    st.text(f"📁 {b}")
+
+            except Exception as e:
+                st.error(f"Backup failed: {e}")
+
+        st.caption("Note: Local platform checks protect standard container services. Secure physical directories systematically.")
 
 
 # Footer Branding
 st.divider()
-mode_text = "cloud" if SUPABASE_READY else "local"
+mode_text = "local" if isinstance(conn, MockConnection) else "cloud"
 st.markdown(
     f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • {mode_text} • v0.35
+        Irrigation Dashboard • {mode_text} • v0.36
     </div>
     """,
     unsafe_allow_html=True
