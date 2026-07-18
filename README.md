@@ -60,5 +60,13 @@ If you wish to host the dashboard locally on your machine instead of using the w
 3. **Launch:** Double-click the `Run_Irrigation.bat` file to automatically install libraries and open the system on `localhost`.
 4. **Local Directory Button:** When running locally on Windows, an extra button appears in the **Data Security** tab allowing you to jump directly to your data folder via Windows File Explorer.
 
+### Running Locally Against the Shared Cloud Database
+
+By default, a local run falls back to local JSON storage. To instead point a local run at the same Supabase/Postgres database used by the hosted deployment (useful for testing with real shared data):
+
+1. Copy `streamlit_secrets.example.toml` to `.streamlit/secrets.toml` in the project root (this path is gitignored and will never be committed).
+2. Fill in the `[connections.postgresql]` URL from your Supabase project (**Project Settings → Database → Connection string**), plus the `[supabase]` block if desired.
+3. Launch the app as usual. The sidebar shows the live connection status: "☁️ Cloud sync active" when connected to Postgres, or "💾 Local-only mode" if it fell back to local JSON.
+
 ---
 *Developed for smart water management and healthy landscapes.*
