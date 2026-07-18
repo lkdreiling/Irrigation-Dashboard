@@ -46,25 +46,32 @@ Build a workable irrigation dashboard that:
 - The version string is tracked in two places and must be bumped together:
   - `README.md` title (line 1)
   - Footer string in `et_dashboard.py` (`f"Irrigation Dashboard • {mode_text} • vX.XX"`, near the end of the file)
-- Current version: **v0.36**.
+- **Shipped** (live on `main`, in production): **v0.36**. **In development** (current work branch): **v0.37**. These two numbers will usually differ — `main`'s version only advances when a version branch is merged in per the "Standard merge-to-main sequence" below.
+- When bumping, grep for the *old* version number across `*.py`/`*.md` (`v0\.3[0-9]`-style pattern) and update only the two authoritative "current version" declarations (README title, `et_dashboard.py` footer) plus this line — leave historical mentions alone (e.g. the branch-model list below naming past versions like `v0.33, v0.34, v0.35...`, or dated notes about a specific past merge). Those are historical record, not the live version.
 
 ## Git / Push Workflow
 - **Git is not on PATH / not separately installed on this machine.** The user pushes via **GitHub Desktop**, which bundles its own `git.exe`. Locate it with a glob rather than hardcoding a version:
   `Glob pattern: C:\Users\<user>\AppData\Local\GitHubDesktop\app-*\resources\app\git\cmd\git.exe` — pick the highest `app-x.y.z` folder. Call it directly (e.g. `& $git -C "c:\Irrigation-Dashboard" status`); there's no need to install a separate system Git unless the user asks for one.
-- **Branch model:** `main` is the deploy branch — **Streamlit Community Cloud auto-redeploys from `main` on push**, so pushing to `main` is a production action. Day-to-day work happens on version branches (`v0.33`, `v0.34`, `v0.35`, `v0.36`, ...). To ship: merge the current version branch into `main` and push `main`. Always confirm with the user before pushing to `main` specifically — pushing a version branch is lower-stakes, pushing `main` redeploys production.
+- **Branch model:** `main` is the deploy branch — **Streamlit Community Cloud auto-redeploys from `main` on push**, so pushing to `main` is a production action. Day-to-day work happens on version branches (`v0.33`, `v0.34`, `v0.35`, `v0.36`, `v0.37`, ...). To ship: merge the current version branch into `main` and push `main`. Always confirm with the user before pushing to `main` specifically — pushing a version branch is lower-stakes, pushing `main` redeploys production.
 - **Known gotcha — spurious conflicts from squash merges:** PRs into `main` on this repo are merged via GitHub's "Squash and merge," which collapses a whole version branch into a single commit on `main`. A later `git merge <version-branch>` into `main` can then show conflicts in places where the actual text is identical, because git can't tell that the squash commit and the individual commits produced the same content. Before manually reconciling a conflict, check whether it's spurious:
   `git diff <main-only-commit>:<file> <equivalent-commit-on-branch>:<file>`
   If that's empty, the version branch is a strict superset for that file — resolve with `git checkout --theirs -- <file>` instead of hand-editing conflict markers. (This is exactly what happened merging v0.36 into main on 2026-07-18: `main`'s `fc62797` and v0.36's `4adf548` were byte-identical for `et_dashboard.py`, confirming `v0.36` was safe to take wholesale.)
 - **Files that should never be hand-merged, only deleted/untracked on conflict:** `.cache.sqlite` (binary Open-Meteo request cache) and per-user files under `IrrigationData/` (e.g. `Home_weather.json`). Both are regenerable runtime data, already covered by `.gitignore`, but remain tracked from before those ignore rules existed. On conflict, resolve with `git rm` / `git rm --cached`, not a content merge.
 - **If `git rm .cache.sqlite` fails with `unable to unlink ... Invalid argument`:** a locally running Streamlit process has the file locked. Stop it first (stop the background task, or kill the `streamlit run` process), then retry.
 - **Before finalizing any merge:** run `python -m py_compile et_dashboard.py` (via `%USERPROFILE%\anaconda3\python.exe`) to confirm the resolved file is syntactically valid, and grep the repo for leftover conflict markers (`^<<<<<<<|^=======$|^>>>>>>>`) to make sure nothing was missed, before `git commit` / `git push`.
-- **Standard merge-to-main sequence:**
+- **Standard merge-to-main sequence (shipping a finished version branch):**
   1. `git fetch origin`; confirm local `main` matches `origin/main` (no commits either direction) before touching anything.
   2. `git checkout main`
   3. `git merge <version-branch> --no-ff -m "Merge branch '<version-branch>' into main"`
   4. Resolve conflicts per the rules above.
   5. Compile-check + conflict-marker grep.
-  6. `git commit --no-edit` (or with message if not already mid-merge-commit), then `git push origin main`.
+  6. `git commit --no-edit` (or with message if not already mid-merge-commit), then `git push origin main` — always confirm with the user before this specific push, since it redeploys production.
+- **Starting a new version branch (this is the standard "get ready for the next version" process, used going forward):**
+  1. `git fetch origin`; confirm local `main` matches `origin/main` before branching, same check as above.
+  2. `git checkout -b vX.YY main` (branch from `main`, not from the previous version branch, so it starts from what's actually shipped).
+  3. `git push -u origin vX.YY` to set up tracking immediately, even before any content changes.
+  4. Bump the version string per the Versioning section above (README title, `et_dashboard.py` footer, and this file's "In development" line) — grep for the old version number first to find every spot, but only touch the live "current version" declarations, not historical mentions.
+  5. Compile-check (`python -m py_compile et_dashboard.py`), then commit and `git push origin vX.YY`. Pushing a version branch is low-stakes (doesn't touch `main`/production) and doesn't need the same confirmation as a `main` push.
 
 ## Known Implementation Focus Areas
 - Decide what to do with the orphaned `users` / `zone_profiles` tables in Supabase (see Current State).
