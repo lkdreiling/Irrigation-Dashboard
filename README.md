@@ -1,4 +1,4 @@
-# 🌱 Irrigation Dashboard v0.38
+# 🌱 Irrigation Dashboard v0.39
 
 Irrigation Dashboard is a localized, web-based Evapotranspiration (ET) application that helps you manage lawn and garden watering with precision. By pulling real-time weather data and calculating soil moisture depletion, it tells you exactly **when** to water and **how much** to apply.
 

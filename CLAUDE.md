@@ -47,7 +47,7 @@ Build a workable irrigation dashboard that:
 - The version string is tracked in two places and must be bumped together:
   - `README.md` title (line 1)
   - Footer string in `et_dashboard.py` (`f"Irrigation Dashboard • {mode_text} • vX.XX"`, near the end of the file)
-- **Shipped** (live on `main`, in production): **v0.37**. **In development** (current work branch): **v0.38**. These two numbers will usually differ — `main`'s version only advances when a version branch is merged in per the "Standard merge-to-main sequence" below.
+- **Shipped** (live on `main`, in production): **v0.38**. **In development** (current work branch): **v0.39**. These two numbers will usually differ — `main`'s version only advances when a version branch is merged in per the "Standard merge-to-main sequence" below.
 - When bumping, grep for the *old* version number across `*.py`/`*.md` (`v0\.3[0-9]`-style pattern) and update only the two authoritative "current version" declarations (README title, `et_dashboard.py` footer) plus this line — leave historical mentions alone (e.g. the branch-model list below naming past versions like `v0.33, v0.34, v0.35...`, or dated notes about a specific past merge). Those are historical record, not the live version.
 
 ## Git / Push Workflow

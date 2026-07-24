@@ -2190,7 +2190,7 @@ mode_text = "local" if isinstance(conn, MockConnection) else "cloud"
 st.markdown(
     f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • {mode_text} • v0.38
+        Irrigation Dashboard • {mode_text} • v0.39
     </div>
     """,
     unsafe_allow_html=True
