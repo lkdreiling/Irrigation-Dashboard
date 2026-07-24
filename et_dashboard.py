@@ -1368,7 +1368,7 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             "longitude": lon,
             "start_date": str(start_dt),
             "end_date": str(today),
-            "daily": ["et0_fao56", "precipitation"],
+            "daily": ["et0_fao_evapotranspiration", "precipitation_sum"],
             "timezone": "auto",
             "wind_speed_unit": "mph",
             "precipitation_unit": "inch"
@@ -1436,6 +1436,41 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
         return None
 
 
+# 7.2b Rain-Confidence Fetch
+# Deliberately separate from fetch_weather_integrated above rather than folded into it:
+# precipitation_probability_max is forecast-only (meaningless for archived history) and
+# shifts run-to-run in a way the ET0/Rain archive doesn't, so it doesn't belong on that
+# function's 20h durable fetch gate or in the shared weather_cache table -- it's cheap to
+# re-ask for and doesn't need to be persisted. Session-cached for a few hours so reruns and
+# tab switches don't re-hit the API.
+@st.cache_data(ttl=21600)
+def fetch_rain_probability(lat, lon):
+    try:
+        responses = openmeteo.weather_api(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": ["precipitation_probability_max"],
+                "timezone": "auto",
+                "forecast_days": 14,
+            },
+        )
+        daily = responses[0].Daily()
+        prob_values = daily.Variables(0).ValuesAsNumpy()
+        dates = pd.date_range(
+            start=pd.to_datetime(daily.Time(), unit="s", utc=True),
+            end=pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
+            freq=pd.Timedelta(seconds=daily.Interval()),
+            inclusive="left",
+        )
+        df = pd.DataFrame({"time": dates, "Rain Prob (%)": prob_values})
+        df['time'] = df['time'].dt.tz_convert(None).dt.normalize()
+        return df
+    except Exception:
+        return None
+
+
 # 7.3 Weather Processing and Data Merger
 
 # Always load the archive first (cloud cache if connected, else local JSON) -- this is what
@@ -1444,30 +1479,46 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
 # invalidates and re-reads this, so unrelated reruns don't re-hit the DB for it.
 df_permanent = get_weather_history_cached(lat, lon)
 
-zone_start_date = pd.to_datetime(
-    current_zone.get("start_date", str(datetime.now().date() - pd.Timedelta(days=7)))
-).date()
+# How far back we want each location's weather archive to reach, regardless of when any
+# particular zone at that location happens to have been created -- weather history belongs
+# to the location, not to a zone. Open-Meteo's archive-api has no chunking limit for this (a
+# single call can span a full year or more via start_date/end_date -- only the separate
+# forecast-api's `past_days` parameter is capped at 92), so reaching this target is one extra
+# request per location the first time it's viewed after this was added, not many.
+WEATHER_HISTORY_TARGET_DAYS = 365
 
 # Base the "how far back is already covered" check only on archived history, not the forecast
 # rows also stored in the archive (their dates run into the future and would otherwise make
 # the gap look already closed).
 today_date = datetime.now().date()
+target_earliest_date = today_date - timedelta(days=WEATHER_HISTORY_TARGET_DAYS)
 historical = df_permanent[pd.to_datetime(df_permanent['time']).dt.date <= today_date] if not df_permanent.empty else df_permanent
 
+needs_backfill = False
 if not historical.empty:
-    # Only ask Open-Meteo for a couple of days of overlap past what's already archived,
-    # instead of re-requesting the zone's entire history on every fetch.
-    overlap_start_date = (pd.to_datetime(historical['time']).max() - pd.Timedelta(days=2)).date()
-    effective_start_date = max(zone_start_date, overlap_start_date)
+    earliest_archived_date = pd.to_datetime(historical['time']).min().date()
+    if earliest_archived_date > target_earliest_date:
+        # Archive doesn't reach the target window yet -- backfill deeper in one shot instead
+        # of waiting ~365 daily top-ups for it to grow there on its own.
+        effective_start_date = target_earliest_date
+        needs_backfill = True
+    else:
+        # Already covers the target window -- only ask for a couple of days of overlap past
+        # what's archived, instead of re-requesting the whole window on every routine fetch.
+        effective_start_date = (pd.to_datetime(historical['time']).max() - pd.Timedelta(days=2)).date()
 else:
-    # No history archived yet for this location -- do the one-time full backfill from the zone's start date.
-    effective_start_date = zone_start_date
+    # No history archived yet for this location -- one-time full backfill to the target window.
+    effective_start_date = target_earliest_date
+    needs_backfill = True
 
 # Durable gate: skip the network call entirely if this location was already fetched recently.
 # This lives in the DB/local-JSON (not st.cache_data or the requests_cache sqlite file), so it
 # still holds even after a Streamlit Cloud container reboot wipes those in-process caches.
+# needs_backfill bypasses this specifically -- otherwise a location that already had a shallow
+# fetch stamp (e.g. from before WEATHER_HISTORY_TARGET_DAYS existed) would have to wait up to
+# 20h for the one-time deep backfill to even attempt running.
 last_fetch = get_weather_last_fetch_cached(lat, lon)
-needs_fetch = last_fetch is None or (datetime.utcnow() - last_fetch) > timedelta(hours=20)
+needs_fetch = needs_backfill or last_fetch is None or (datetime.utcnow() - last_fetch) > timedelta(hours=20)
 
 df_api = None
 if needs_fetch:
@@ -1485,8 +1536,9 @@ elif not df_permanent.empty:
 if df_api is not None or not df_permanent.empty:
     df_daily['time'] = pd.to_datetime(df_daily['time']).dt.normalize()
     
-    # Enforce threshold constraints to retain structural history
-    earliest_allowed_date = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=180)
+    # Enforce threshold constraints to retain structural history -- matches the backfill
+    # target above so the graph/table can actually show everything that gets archived.
+    earliest_allowed_date = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=WEATHER_HISTORY_TARGET_DAYS)
     df_daily = df_daily[df_daily['time'] >= earliest_allowed_date]
     
     # Merge local zone schedules and database records
@@ -1506,6 +1558,12 @@ if df_api is not None or not df_permanent.empty:
     today_dt = pd.Timestamp(datetime.now().date()).normalize()
     df_history = df_daily[df_daily['time'] < today_dt].copy()
     df_forecast = df_daily[df_daily['time'] >= today_dt].copy()
+
+    rain_prob_df = fetch_rain_probability(lat, lon)
+    if rain_prob_df is not None:
+        df_forecast = pd.merge(df_forecast, rain_prob_df, on='time', how='left')
+    else:
+        df_forecast['Rain Prob (%)'] = float('nan')
 
 
 # ==============================================================================
@@ -1537,8 +1595,13 @@ if df_api is not None or not df_permanent.empty:
                 running_deficit = 0.0
 
         current_deficit = running_deficit
+    # Precipitation Rate (PR) is the bridge quantity in the Irrigation Association's own
+    # scheduling formula (Landscape Irrigation BMP, Appendix C: RT = ETL x 60 / PR) -- computed
+    # once here and reused for both the forward (deficit -> runtime) and reverse (logged
+    # runtime -> applied depth) directions instead of going through gallons first.
+    pr_in_hr = (96.25 * flow / area) if area > 0 else 0
+    runtime = (current_deficit * 60 / pr_in_hr) if pr_in_hr > 0 else 0
     gallons = current_deficit * area * 0.623
-    runtime = gallons / flow if flow > 0 else 0
 
 
 # ==============================================================================
@@ -1548,8 +1611,21 @@ if df_api is not None or not df_permanent.empty:
         st.markdown(f"### {active_prop} : {active_zone_name} <span style='color:gray; font-size:0.8em;'>({active_zip})</span>", unsafe_allow_html=True)
         st.divider()
 
-        seven_day_et = df_forecast.iloc[0:7]['ET0 (in)'].sum() if len(df_forecast) >= 7 else df_forecast['ET0 (in)'].sum()
-        seven_day_rain = df_forecast.iloc[0:7]['Rain (in)'].sum() if len(df_forecast) >= 7 else df_forecast['Rain (in)'].sum()
+        seven_day_window = df_forecast.iloc[0:7] if len(df_forecast) >= 7 else df_forecast
+        seven_day_et = seven_day_window['ET0 (in)'].sum()
+        seven_day_rain = seven_day_window['Rain (in)'].sum()
+
+        # Confidence behind seven_day_rain: the forecasted amount is already a model-mean
+        # expected value, so folding probability into it as a multiplier would double-count
+        # uncertainty that's already baked in. Instead use probability as a gate on whether to
+        # act on it -- and anchor that gate to whichever day(s) actually drive the total,
+        # rather than the week's single wettest-chance day, so a confident drizzle elsewhere
+        # in the window can't paper over an uncertain deluge.
+        RAIN_SKIP_CONFIDENCE_THRESHOLD = 50  # percent
+        rain_days = seven_day_window[seven_day_window['Rain (in)'] > 0.05]
+        prob_source = rain_days if not rain_days.empty else seven_day_window
+        rain_confidence = prob_source['Rain Prob (%)'].max() if 'Rain Prob (%)' in prob_source else float('nan')
+        rain_confidence = None if pd.isna(rain_confidence) else rain_confidence
 
         # Establish system recommendation warning boundaries
         if current_deficit < ad_limit:
@@ -1581,29 +1657,51 @@ if df_api is not None or not df_permanent.empty:
         )
 
         # Column D: Cumulative Rain Forecast
-        m4.metric(
-            label="7-Day Rain Forecast", 
-            value=f"{seven_day_rain:.2f}\"",
-            help="Total precipitation expected over the next week."
+        # st.metric's delta slot always renders an up/down arrow glyph (delta_color="off" only
+        # mutes its color, it can't remove it), and there's no arrow-less variant -- so this is
+        # a hand-built lookalike instead, styled with opacity rather than a hardcoded color so
+        # it still tracks the app's light/dark theme.
+        confidence_html = (
+            f'<div style="font-size:0.875rem; opacity:0.6; line-height:1.4;">{rain_confidence:.0f}% chance</div>'
+            if rain_confidence is not None else ''
         )
+        with m4:
+            st.markdown(
+                f"""
+                <div title="Total precipitation expected over the next week, and the chance of rain on the day(s) driving that total (Open-Meteo precipitation_probability_max).">
+                    <div style="font-size:0.875rem; opacity:0.6;">7-Day Rain Forecast</div>
+                    <div style="font-size:2.25rem; font-weight:600; line-height:1.2;">{seven_day_rain:.2f}"</div>
+                    {confidence_html}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
         st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
         st.divider()
 
         # Immediate Guidance Callouts
         if seven_day_rain > current_deficit and current_deficit > 0:
-            st.warning(f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!")
+            if rain_confidence is not None and rain_confidence < RAIN_SKIP_CONFIDENCE_THRESHOLD:
+                st.info(f"🌦️ **Rain is possible, but not confident:** The 7-day forecast predicts **{seven_day_rain:.2f}\"**, but the day(s) driving that total are only **{rain_confidence:.0f}%** likely to see rain. Watering as planned is probably still the safer bet.")
+            else:
+                st.warning(f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!")
         elif current_deficit <= 0 and not zone_logs:
             # Never-watered zone reading 0" is an assumption (field capacity), not a measurement --
             # pair it with a reference runtime computed as if the zone were bone dry (PWP) so a
             # first-time user has a number to start from instead of just "you're fine, do nothing."
-            full_gallons = paw_total * area * 0.623
-            full_runtime = full_gallons / flow if flow > 0 else 0
-            st.info(f"🌱 **New Zone:** Starting at 0\" deficit (assumed field capacity) until real readings accumulate. If this zone were completely dry, a full soak would take an estimated **{full_runtime:.1f} minutes** at current settings.")
+            full_runtime = (paw_total * 60 / pr_in_hr) if pr_in_hr > 0 else 0
+            full_cycles, _, _ = core_logic.recommend_cycle_soak(pr_in_hr, soil_choice, full_runtime)
+            cycle_note = f" Consider **{full_cycles} cycles of ~{full_runtime / full_cycles:.1f} min** each (30–40 min soak between starts) instead of one continuous pass." if full_cycles > 1 else ""
+            st.info(f"🌱 **New Zone:** Starting at 0\" deficit (assumed field capacity) until real readings accumulate. If this zone were completely dry, a full soak would take an estimated **{full_runtime:.1f} minutes** at current settings.{cycle_note}")
         elif current_deficit <= 0:
             st.success(f"✅ **Soil is Hydrated!**")
         else:
-            st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity.")
+            cycles, _, _ = core_logic.recommend_cycle_soak(pr_in_hr, soil_choice, runtime)
+            if cycles > 1:
+                st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity — but split into **{cycles} cycles of ~{runtime / cycles:.1f} min** each (30–40 min soak between starts) rather than one continuous pass (see Reference F).")
+            else:
+                st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity.")
 
 
 # ==============================================================================
@@ -1617,17 +1715,24 @@ if selected_tab == "Dashboard":
         if not df_daily.empty:
             now_dt = pd.Timestamp(datetime.now().date()).normalize()
 
-            # Configure Default View Zoom Bounds
+            # Configure Default View Zoom Bounds. df_zoom is filtered directly to this window
+            # rather than to the full WEATHER_HISTORY_TARGET_DAYS archive, and the x scale is
+            # left to infer its domain from that (now-narrow) data instead of an explicit
+            # scale(domain=[...]) override -- Streamlit's st.altair_chart renders blank/
+            # collapsed when a scale has an explicit datetime domain (confirmed:
+            # streamlit/streamlit#5733, a regression since 1.14, fixed upstream in PR #11514
+            # but not yet in the 1.37.1 installed here). This was the actual cause of the
+            # squished graph -- everything else tried (container width, removing .interactive,
+            # theme=None, fixed pixel width) addressed real but unrelated non-issues. Full
+            # history beyond this window is still in the table below, which was never affected
+            # since it's a plain dataframe, not a Vega scale.
             view_start = now_dt - pd.Timedelta(days=7)
             view_end = now_dt + pd.Timedelta(days=14)
-            lookback_days = 180  
-            data_start = now_dt - pd.Timedelta(days=lookback_days)
-            df_zoom = df_daily[df_daily['time'] >= data_start].copy()
+            df_zoom = df_daily[(df_daily['time'] >= view_start) & (df_daily['time'] <= view_end)].copy()
 
-            # Define Unified Interactive X-Axis Scale
-            x_axis = alt.X('time:T', 
-                           title='Date', 
-                           scale=alt.Scale(domain=[view_start.strftime('%Y-%m-%d'), view_end.strftime('%Y-%m-%d')]),
+            # Define Unified X-Axis (domain inferred from df_zoom -- no explicit scale.domain)
+            x_axis = alt.X('time:T',
+                           title='Date',
                            axis=alt.Axis(format='%b %d'))
 
             # Chart Layer A: Evapotranspiration Line
@@ -1657,10 +1762,11 @@ if selected_tab == "Dashboard":
             ).encode(x=x_axis)
 
 
-            # Combine, render, and freeze scale properties to prevent scrolling issues
+            # Combine and render. Not calling .interactive() -- pan/zoom isn't needed now that
+            # df_zoom is already scoped to the intended window; full history is in the table.
             final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
-                height=400
-            ).interactive(bind_y=False)
+                height=400, width='container'
+            )
 
             st.altair_chart(final_chart, use_container_width=True)
 
@@ -1676,7 +1782,7 @@ if selected_tab == "Dashboard":
 
     # Forecast and Archive Tables View
     with st.expander("📋 View Forecast & History Tables", expanded=False):
-        tab1, tab2 = st.tabs(["🗓️ Forecast (Next 14 Days)", "📜 History (Past 90 Days)"])
+        tab1, tab2 = st.tabs(["🗓️ Forecast (Next 14 Days)", f"📜 History (Past {WEATHER_HISTORY_TARGET_DAYS} Days)"])
         with tab1:
             st.dataframe(df_forecast.set_index("time").style.format("{:.2f}"), use_container_width=True)
         with tab2:
@@ -1817,6 +1923,7 @@ if selected_tab == "Reference":
         st.caption(f"Plant Available Water: {aw_per_foot:.2f} in/ft × {rz_ft:.2f} ft = **{paw_total:.2f} inches**")
         st.latex(r"AD = PAW \times MAD")
         st.caption(f"Allowable Depletion: {paw_total:.2f} in × {mad/100:.2f} = **{ad_limit:.2f} inches**")
+        st.caption("IA Landscape Irrigation BMP, Appendix C computes this same value in one step as **d_max = AW × Z_r × MAD** (their \"maximum irrigation depth\") — identical math to AW → PAW → AD above, just not broken into an intermediate PAW term. IA calls this both the irrigation trigger *and* the ceiling on how much depth to apply in a single irrigation event — see Reference D.")
 
         st.write("#### Soil Reference Table (all soil types)")
         soil_df = pd.DataFrame([
@@ -1825,6 +1932,7 @@ if selected_tab == "Reference":
                 "FC (in/ft)": info["FC"] * 12,
                 "PWP (in/ft)": info["PWP"] * 12,
                 "AW (in/ft)": (info["FC"] - info["PWP"]) * 12,
+                "Intake Rate (in/hr)": core_logic.INFILTRATION_DATA.get(name, {}).get("IntakeRate_in_hr"),
             }
             for name, info in core_logic.SOIL_DATA.items()
         ])
@@ -1832,12 +1940,12 @@ if selected_tab == "Reference":
             soil_df.style.apply(
                 lambda row: ["background-color: rgba(0,150,0,0.15)" if row["Soil Type"] == soil_choice else "" for _ in row],
                 axis=1
-            ).format({"FC (in/ft)": "{:.2f}", "PWP (in/ft)": "{:.2f}", "AW (in/ft)": "{:.2f}"}),
+            ).format({"FC (in/ft)": "{:.2f}", "PWP (in/ft)": "{:.2f}", "AW (in/ft)": "{:.2f}", "Intake Rate (in/hr)": "{:.2f}"}),
             hide_index=True,
             use_container_width=True
         )
         depletion_status = (current_deficit / ad_limit) * 100 if ad_limit > 0 else 0
-        st.caption(f"**Current Status:** Your deficit is {current_deficit:.2f}\", or {depletion_status:.1f}% of your Allowable Depletion limit. Soil constants are Saxton & Rawls (2006) texture-class estimates — see References tab.")
+        st.caption(f"**Current Status:** Your deficit is {current_deficit:.2f}\", or {depletion_status:.1f}% of your Allowable Depletion limit. FC/PWP/AW are Saxton & Rawls (2006) texture-class estimates; Intake Rate is saturated hydraulic conductivity by texture class — see References tab, Reference F.")
 
     with tab_plant:
         st.write(f"### Plant Profile: {plant_choice}")
@@ -1898,14 +2006,15 @@ if selected_tab == "Reference":
 
     with tab_calc:
         st.write(f"### Water Balance: {active_zone_name}")
-        st.info("💡 **How the daily deficit becomes a sprinkler runtime:**")
+        st.info("💡 **How the daily deficit becomes a sprinkler runtime — following the Irrigation Association's own scheduling method (Landscape Irrigation BMP, Appendix C: *Basic Landscape Irrigation Scheduling*):**")
         st.markdown("""
         Every day, this zone's soil moisture deficit grows by crop-adjusted water use
-        (**ETc**, from the Plant Water Use tab) and shrinks by rain plus any logged
-        irrigation, floored at field capacity (0" deficit — it never carries below that,
-        even after a large rain event). Once you're ready to water, that deficit converts
-        directly into a water volume and a sprinkler runtime using the zone's area and
-        flow rate.
+        (**ETc**, from the Plant Water Use tab — IA Appendix C calls this same quantity
+        **ETL = ET₀ × KL**, "landscape water requirement"; our Kc plays KL's role) and shrinks
+        by rain plus any logged irrigation, floored at field capacity (0" deficit — it never
+        carries below that, even after a large rain event). Once you're ready to water, IA's
+        Appendix C converts that requirement into a runtime in two steps: first the sprinklers'
+        **Precipitation Rate (PR)**, then **Run Time (RT)** from PR and the depth needed.
 
         **Never-watered zones are the one exception.** A zone with no logged watering
         history skips this loop entirely and reads a flat 0" deficit, rather than
@@ -1916,16 +2025,38 @@ if selected_tab == "Reference":
         """)
         st.latex(r"Deficit_{day} = Deficit_{day-1} + (ET_0 \times K_c) - (Rain + Irrigation)")
         st.caption(f"This zone's **{plant_choice}** Kc of **{kc_value:.2f}** is baked into every day of that loop — see the *Plant Water Use* tab.")
-        st.latex(r"Gallons = Deficit \times Area \times 0.623")
-        st.caption(f"Water Volume: {current_deficit:.3f}\" × {area} sq ft × 0.623 = **{gallons:.1f} Gallons**")
-        st.latex(r"Runtime = \frac{Gallons}{Flow}")
-        st.caption(f"Runtime: {gallons:.1f} gal / {flow} GPM = **{runtime:.1f} Minutes**")
+        st.latex(r"PR = \frac{96.3 \times Flow}{Area}")
+        st.caption(f"Precipitation Rate (IA Appendix C, \"How Long to Irrigate\"): (96.25 × {flow} GPM) / {area} sq ft = **{pr_in_hr:.3f} in/hr**. This app computes with the unrounded 96.25 rather than IA's published rounded 96.3 — same formula, tighter precision.")
+        st.latex(r"RT = \frac{Deficit \times 60}{PR}")
+        st.caption(f"Run Time (IA Appendix C's RT = ET_L × 60 / PR, applied directly): ({current_deficit:.3f}\" × 60) / {pr_in_hr:.3f} in/hr = **{runtime:.1f} Minutes**.")
+        st.caption(f"Equivalent water volume, for reference: {current_deficit:.3f}\" × {area} sq ft × 0.623 = **{gallons:.1f} gallons**.")
 
         st.write("#### Runtime Breakdown")
         st.dataframe(pd.DataFrame({
             "Step": ["Net Depth Needed", "Water Volume", "Runtime"],
             "Value": [f"{current_deficit:.3f}\"", f"{gallons:.1f} gal", f"{runtime:.1f} min"]
         }), hide_index=True, use_container_width=True)
+
+        st.write("#### Cycle-and-Soak (avoiding runoff)")
+        st.markdown("""
+        IA Appendix C notes that the calculated Run Time often applies water faster than
+        the soil can absorb it, causing runoff before a single continuous pass finishes.
+        Its fix is **cycle-and-soak**: split the same total runtime into several shorter
+        cycles with a soak period between them so water has time to infiltrate before the
+        next cycle starts, rather than running longer than the soil can take in one pass.
+        IA's own worked example splits spray heads on fine/heavy soil into 4 cycles of
+        5 minutes each, with 30–40 minutes of soak time between cycle starts — but rather
+        than IA's qualitative "coarse/fine" language, this compares the zone's own
+        Precipitation Rate directly against a published intake (infiltration) rate for the
+        selected soil texture (see Reference F) to decide how many cycles are actually needed.
+        """)
+        cycles, _intake_rate, _cycle_ratio = core_logic.recommend_cycle_soak(pr_in_hr, soil_choice, runtime)
+        if cycles > 1:
+            st.info(f"This zone's Precipitation Rate (**{pr_in_hr:.2f} in/hr**) is about **{_cycle_ratio:.1f}x** **{soil_choice}**'s published intake rate (**{_intake_rate:.2f} in/hr**) — consider **{cycles} cycles of ~{runtime / cycles:.1f} min** each (30–40 min soak between starts) instead of one {runtime:.1f}-minute continuous pass.")
+            if cycles == 6:
+                st.caption("Capped at 6 cycles for a practical recommendation — the actual PR/intake-rate ratio is higher than that; watch closely for runoff even with this split.")
+        else:
+            st.caption(f"This zone's Precipitation Rate (**{pr_in_hr:.2f} in/hr**) is within **{soil_choice}**'s published intake rate (**{_intake_rate:.2f} in/hr**) — a single {runtime:.1f}-minute pass shouldn't cause runoff. This is general guidance from published infiltration-rate literature (Reference F), not a substitute for your own runoff observations in the field.")
 
         st.write("#### How Area & Flow Are Determined (Easy vs. Advanced Mode)")
         st.info("💡 **Why this zone's area and GPM are what they are:**")
@@ -1967,10 +2098,9 @@ if selected_tab == "Reference":
         st.caption("Averages compiled from Rain Bird, Hunter, Toro, and Orbit residential nozzle catalogs (irrigation_head_specs/head_database.csv in the repo) — see Reference E.")
 
         st.write("#### Manual Watering Log Conversion")
-        st.markdown("Logging a runtime in minutes uses the matched-precipitation-rate formula to convert flow and area into an applied depth:")
-        st.latex(r"Rate_{in/hr} = \frac{96.25 \times GPM}{Area}")
-        manual_rate = (96.25 * flow / area) if area > 0 else 0
-        st.caption(f"This zone's rate: (96.25 × {flow}) / {area} = **{manual_rate:.3f} in/hr**. This app uses the unrounded 96.25 constant rather than the commonly published rounded 96.3 — same formula, tighter precision.")
+        st.markdown("Logging a runtime in minutes runs IA Appendix C's RT = ETL × 60 / PR equation in reverse, using this zone's PR computed above, to recover an applied depth:")
+        st.latex(r"Depth = \frac{RT \times PR}{60}")
+        st.caption(f"This zone's rate: **{pr_in_hr:.3f} in/hr** (96.25 × {flow} GPM / {area} sq ft).")
         st.caption("Precipitation-rate methodology follows Irrigation Association matched-precipitation guidance — see References tab.")
 
     with tab_refs:
@@ -1984,13 +2114,18 @@ if selected_tab == "Reference":
 
         **Reference C: Weather Science — Reference Crop ET Evaluations**
         * Allen, Richard G., et al. 'Crop Evapotranspiration: Guidelines for Computing Crop Water Requirements.' *FAO Irrigation and Drainage Paper 56*, 1998.
+        * Rain-forecast confidence (Dashboard tab, "Rain is coming" guidance) uses Open-Meteo's `precipitation_probability_max` daily variable, an ensemble-model-derived percentage, separate from the deterministic `precipitation` amount used everywhere else in this app.
 
         **Reference D: Calculation Logic — Precipitation Rate & Runtime Methodology**
-        * Irrigation Association and American Society of Irrigation Consultants. *Landscape Irrigation Best Management Practices*. 2014. [irrigation.org](https://www.irrigation.org/IA/FileUploads/IA/Certification/BMPDesign_Install_Manage.pdf)
+        * Irrigation Association and American Society of Irrigation Consultants. *Landscape Irrigation Best Management Practices*. 2014, **Appendix C: "Basic Landscape Irrigation Scheduling," pp. 47–53**. [irrigation.org](https://www.irrigation.org/IA/FileUploads/IA/Certification/BMPDesign_Install_Manage.pdf) — source of this app's d_max = AW × Zr × MAD (maximum irrigation depth), PR = 96.3 × GPM / Area (precipitation rate), and RT = ETL × 60 / PR (run time) equations, followed directly in the Water Balance and Soil Physics Logic tabs above.
         * Irrigation Association. *Turf and Landscape Irrigation Best Management Practices*. 2002 (rev.).
 
         **Reference E: Easy Mode — Irrigation Head Flow & Radius Averages**
         * Rain Bird, Hunter, Toro, and Orbit residential nozzle catalogs (spray, rotor, and drip product lines), compiled 2026-07-18. Full source datasheets and per-nozzle data in `irrigation_head_specs/` in this repo — see `SOURCES.md` there for the manufacturer-by-manufacturer breakdown.
+
+        **Reference F: Soil Infiltration (Intake) Rates — Cycle-and-Soak Sizing**
+        * Rawls, W.J., Brakensiek, D.L., and Saxton, K.E. 'Estimation of Soil Water Properties.' *Transactions of the ASAE*, 25(5), 1982, pp. 1316–1320. Saturated hydraulic conductivity (Ksat) by USDA texture class, source for 11 of this app's 12 soil types.
+        * Gupta, S., Hengl, T., Lehmann, P., Bonetti, S., and Or, D. 'SoilKsatDB: Global Database of Soil Saturated Hydraulic Conductivity Measurements for Geoscience Applications.' *Earth System Science Data*, 13(4), 2021, pp. 1593–1612. [doi.org/10.5194/essd-13-1593-2021](https://doi.org/10.5194/essd-13-1593-2021) — source for this app's "Silt" intake rate, the one texture class not tabulated in Rawls et al. (1982).
         """)
 
 
@@ -2055,7 +2190,7 @@ mode_text = "local" if isinstance(conn, MockConnection) else "cloud"
 st.markdown(
     f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • {mode_text} • v0.37
+        Irrigation Dashboard • {mode_text} • v0.38
     </div>
     """,
     unsafe_allow_html=True
