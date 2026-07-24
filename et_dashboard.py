@@ -1715,17 +1715,24 @@ if selected_tab == "Dashboard":
         if not df_daily.empty:
             now_dt = pd.Timestamp(datetime.now().date()).normalize()
 
-            # Configure Default View Zoom Bounds
+            # Configure Default View Zoom Bounds. df_zoom is filtered directly to this window
+            # rather than to the full WEATHER_HISTORY_TARGET_DAYS archive, and the x scale is
+            # left to infer its domain from that (now-narrow) data instead of an explicit
+            # scale(domain=[...]) override -- Streamlit's st.altair_chart renders blank/
+            # collapsed when a scale has an explicit datetime domain (confirmed:
+            # streamlit/streamlit#5733, a regression since 1.14, fixed upstream in PR #11514
+            # but not yet in the 1.37.1 installed here). This was the actual cause of the
+            # squished graph -- everything else tried (container width, removing .interactive,
+            # theme=None, fixed pixel width) addressed real but unrelated non-issues. Full
+            # history beyond this window is still in the table below, which was never affected
+            # since it's a plain dataframe, not a Vega scale.
             view_start = now_dt - pd.Timedelta(days=7)
             view_end = now_dt + pd.Timedelta(days=14)
-            lookback_days = WEATHER_HISTORY_TARGET_DAYS
-            data_start = now_dt - pd.Timedelta(days=lookback_days)
-            df_zoom = df_daily[df_daily['time'] >= data_start].copy()
+            df_zoom = df_daily[(df_daily['time'] >= view_start) & (df_daily['time'] <= view_end)].copy()
 
-            # Define Unified Interactive X-Axis Scale
-            x_axis = alt.X('time:T', 
-                           title='Date', 
-                           scale=alt.Scale(domain=[view_start.strftime('%Y-%m-%d'), view_end.strftime('%Y-%m-%d')]),
+            # Define Unified X-Axis (domain inferred from df_zoom -- no explicit scale.domain)
+            x_axis = alt.X('time:T',
+                           title='Date',
                            axis=alt.Axis(format='%b %d'))
 
             # Chart Layer A: Evapotranspiration Line
@@ -1755,10 +1762,11 @@ if selected_tab == "Dashboard":
             ).encode(x=x_axis)
 
 
-            # Combine, render, and freeze scale properties to prevent scrolling issues
+            # Combine and render. Not calling .interactive() -- pan/zoom isn't needed now that
+            # df_zoom is already scoped to the intended window; full history is in the table.
             final_chart = alt.layer(rain_chart, irr_chart, et_chart, today_line).properties(
-                height=400
-            ).interactive(bind_y=False)
+                height=400, width='container'
+            )
 
             st.altair_chart(final_chart, use_container_width=True)
 
