@@ -1743,7 +1743,33 @@ if selected_tab == "Dashboard":
     with st.expander("📈 View Water Balance Graph", expanded=True):
         st.write(f"### 📈 Water Balance for {active_zone_name}")
 
-        if not df_daily.empty:
+        chart_view = st.radio(
+            "Chart view",
+            ["Daily (ET / Rain / Irrigation)", "Yearly Accumulated Rainfall"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="water_balance_chart_view",
+        )
+
+        if chart_view == "Yearly Accumulated Rainfall":
+            current_year = datetime.now().year
+            ytd_df = df_history[df_history['time'].dt.year == current_year].sort_values('time').copy()
+            if not ytd_df.empty:
+                ytd_df['Cumulative Rain (in)'] = ytd_df['Rain (in)'].cumsum()
+                ytd_total = ytd_df['Cumulative Rain (in)'].iloc[-1]
+                st.caption(f"Year-to-date rainfall for {current_year}: **{ytd_total:.2f}\"** (through {ytd_df['time'].max().date()})")
+
+                ytd_chart = alt.Chart(ytd_df).mark_line(strokeWidth=3, color='#1f77b4').encode(
+                    x=alt.X('time:T', title='Date', axis=alt.Axis(format='%b %d')),
+                    y=alt.Y('Cumulative Rain (in):Q', title='Cumulative Inches'),
+                    tooltip=['time:T', 'Cumulative Rain (in):Q']
+                ).properties(height=400, width='container')
+
+                st.altair_chart(ytd_chart, use_container_width=True)
+            else:
+                st.info(f"No archived rainfall history for {current_year} yet.")
+
+        elif not df_daily.empty:
             now_dt = pd.Timestamp(datetime.now().date()).normalize()
 
             # Configure Default View Zoom Bounds. df_zoom is filtered directly to this window
@@ -1801,15 +1827,16 @@ if selected_tab == "Dashboard":
 
             st.altair_chart(final_chart, use_container_width=True)
 
-        # Centered Explanatory Key Legend
-        st.markdown("""
-        <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
-            <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
-            <div><span style="color:#ADD8E6; font-weight:bold;">▇</span> Rain (Gain)</div>
-            <div><span style="color:#003366; font-weight:bold;">▇</span> Irrigation (Gain)</div>
-            <div><span style="color:red; font-weight:bold;">---</span> Today</div>
-        </div>
-        """, unsafe_allow_html=True)
+        # Centered Explanatory Key Legend (daily view only -- the yearly view is a single line)
+        if chart_view != "Yearly Accumulated Rainfall":
+            st.markdown("""
+            <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
+                <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
+                <div><span style="color:#ADD8E6; font-weight:bold;">▇</span> Rain (Gain)</div>
+                <div><span style="color:#003366; font-weight:bold;">▇</span> Irrigation (Gain)</div>
+                <div><span style="color:red; font-weight:bold;">---</span> Today</div>
+            </div>
+            """, unsafe_allow_html=True)
 
     # Forecast and Archive Tables View
     with st.expander("📋 View Forecast & History Tables", expanded=False):
@@ -1817,6 +1844,15 @@ if selected_tab == "Dashboard":
         with tab1:
             st.dataframe(df_forecast.set_index("time").style.format("{:.2f}"), use_container_width=True)
         with tab2:
+            current_year = datetime.now().year
+            ytd_history = df_history[df_history['time'].dt.year == current_year]
+            ytd_totals = ytd_history[['ET0 (in)', 'Rain (in)', 'Irrigation (in)']].sum()
+            st.caption(
+                f"**{current_year} Year-to-Date Totals** — "
+                f"ET: {ytd_totals['ET0 (in)']:.2f}\" | "
+                f"Rain: {ytd_totals['Rain (in)']:.2f}\" | "
+                f"Irrigation: {ytd_totals['Irrigation (in)']:.2f}\""
+            )
             st.dataframe(df_history.sort_values('time', ascending=False).set_index("time").style.format("{:.2f}"), use_container_width=True)
 
 
