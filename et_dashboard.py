@@ -1393,7 +1393,7 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
     try:
         print(f"[OpenMeteo] network fetch: lat={lat} lon={lon} url={url} "
               f"span={params.get('past_days', (today - start_dt).days)}d+forecast start={start_dt} end={today}")
-        responses = openmeteo.weather_api(url, params=params)
+        responses = openmeteo.weather_api(url, params=params, timeout=15)
         response = responses[0]
         
         if is_hourly:
@@ -1455,6 +1455,7 @@ def fetch_rain_probability(lat, lon):
                 "timezone": "auto",
                 "forecast_days": 14,
             },
+            timeout=15,
         )
         daily = responses[0].Daily()
         prob_values = daily.Variables(0).ValuesAsNumpy()
@@ -2190,7 +2191,7 @@ mode_text = "local" if isinstance(conn, MockConnection) else "cloud"
 st.markdown(
     f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • {mode_text} • v0.39.10
+        Irrigation Dashboard • {mode_text} • v0.39.11
     </div>
     """,
     unsafe_allow_html=True
