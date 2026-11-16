@@ -1397,10 +1397,11 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             "precipitation_unit": "inch"
         }
         is_hourly = False
-        # The archive API only ever returns data through "today" -- it has no concept of a
-        # forecast. Without this, any fetch that takes this branch (a deep backfill, or simply
-        # a top-up after being away more than 90 days) would leave the next 14 days completely
-        # empty until the *next* fetch happens to land on the other, smaller-gap branch below.
+        # The archive API has no concept of a forecast, and (being reanalysis-backed) often
+        # lags real time by a day or more -- its last available row isn't reliably "today".
+        # Without a follow-up, any fetch that takes this branch (a deep backfill, or simply a
+        # top-up after being away more than 90 days) would leave the near-term forecast empty
+        # until the *next* fetch happens to land on the other, smaller-gap branch below.
         needs_forecast_followup = True
     else:
         url = "https://api.open-meteo.com/v1/forecast"
@@ -1443,21 +1444,30 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             df_daily['time'] = df_daily['time'].dt.normalize()
 
         if needs_forecast_followup:
-            forecast_responses = openmeteo.weather_api(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "hourly": ["et0_fao_evapotranspiration", "precipitation"],
-                    "timezone": "auto",
-                    "forecast_days": 14,
-                },
-                timeout=15,
-            )
-            df_followup = _hourly_response_to_daily_df(forecast_responses[0].Hourly())
-            # Only keep genuinely future rows -- the archive call above already covers today.
-            df_followup = df_followup[df_followup['time'] > pd.Timestamp(today)]
-            df_daily = pd.concat([df_daily, df_followup], ignore_index=True)
+            # Separate try/except -- a failure here (timeout, rate limit) must not discard the
+            # archive fetch above, which already succeeded and is worth keeping/archiving on
+            # its own even if the forecast top-up doesn't come through this time.
+            try:
+                forecast_responses = openmeteo.weather_api(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": lat,
+                        "longitude": lon,
+                        "hourly": ["et0_fao_evapotranspiration", "precipitation"],
+                        "timezone": "auto",
+                        "forecast_days": 14,
+                    },
+                    timeout=15,
+                )
+                df_followup = _hourly_response_to_daily_df(forecast_responses[0].Hourly())
+                # Only keep rows genuinely past what the archive call already returned -- its
+                # last available date lags "today" by a variable amount, so join on the archive
+                # data's own actual max date rather than assuming it reaches today.
+                archive_max = df_daily['time'].max() if not df_daily.empty else pd.Timestamp(today)
+                df_followup = df_followup[df_followup['time'] > archive_max]
+                df_daily = pd.concat([df_daily, df_followup], ignore_index=True)
+            except Exception:
+                pass  # Keep the archive data; the forecast top-up just didn't come through.
 
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
 
