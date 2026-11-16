@@ -8,5 +8,7 @@ retry-requests
 requests
 
 # --- DATABASE PIPELINES ---
-SQLAlchemy>=2.0.0
+# Pinned below 2.1: SQLAlchemy 2.1 switched the default driver for bare
+# postgresql:// URLs from psycopg2 to psycopg (v3), which isn't installed here.
+SQLAlchemy>=2.0.0,<2.1
 psycopg2-binary>=2.9.0
