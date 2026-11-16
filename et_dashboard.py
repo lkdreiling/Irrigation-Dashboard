@@ -1355,12 +1355,35 @@ openmeteo = openmeteo_requests.Client(session=retry_session)
 
 
 # 7.2 Core Integrated Fetching Routine
+def _hourly_response_to_daily_df(hourly):
+    """Converts an Open-Meteo hourly ET0/precipitation response into a daily-summed,
+    inches-converted dataframe. Shared by the forecast-api branch below and by the
+    archive-api branch's forecast follow-up, since both hit the same hourly endpoint."""
+    et_values = hourly.Variables(0).ValuesAsNumpy()
+    precip_values = hourly.Variables(1).ValuesAsNumpy()
+    dates = pd.date_range(
+        start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+        end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
+        freq=pd.Timedelta(seconds=hourly.Interval()),
+        inclusive="left"
+    )
+    df_hourly = pd.DataFrame({"time": dates, "et0": et_values, "rain": precip_values})
+    df_hourly['time'] = df_hourly['time'].dt.tz_convert(None)
+
+    # Convert metric (mm) to inches and group by day
+    df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
+    df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
+    df_daily['Rain (in)'] = df_daily['rain'] / 25.4
+    df_daily['time'] = df_daily['time'].dt.normalize()
+    return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
+
+
 @st.cache_data(ttl=86400)
 def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
     start_dt = pd.to_datetime(start_date_str).date()
     today = datetime.now().date()
     days_back = (today - start_dt).days
-    
+
     if days_back > 90:
         url = "https://archive-api.open-meteo.com/v1/archive"
         params = {
@@ -1374,6 +1397,12 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             "precipitation_unit": "inch"
         }
         is_hourly = False
+        # The archive API has no concept of a forecast, and (being reanalysis-backed) often
+        # lags real time by a day or more -- its last available row isn't reliably "today".
+        # Without a follow-up, any fetch that takes this branch (a deep backfill, or simply a
+        # top-up after being away more than 90 days) would leave the near-term forecast empty
+        # until the *next* fetch happens to land on the other, smaller-gap branch below.
+        needs_forecast_followup = True
     else:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -1389,36 +1418,21 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             "forecast_days": 14
         }
         is_hourly = True
+        needs_forecast_followup = False
 
     try:
         print(f"[OpenMeteo] network fetch: lat={lat} lon={lon} url={url} "
               f"span={params.get('past_days', (today - start_dt).days)}d+forecast start={start_dt} end={today}")
         responses = openmeteo.weather_api(url, params=params, timeout=15)
         response = responses[0]
-        
+
         if is_hourly:
-            hourly = response.Hourly()
-            et_values = hourly.Variables(0).ValuesAsNumpy()
-            precip_values = hourly.Variables(1).ValuesAsNumpy()
-            
-            dates = pd.date_range(
-                start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
-                end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
-                freq=pd.Timedelta(seconds=hourly.Interval()),
-                inclusive="left"
-            )
-            df_hourly = pd.DataFrame({"time": dates, "et0": et_values, "rain": precip_values})
-            df_hourly['time'] = df_hourly['time'].dt.tz_convert(None) 
-            
-            # Convert metric (mm) to inches and group by day
-            df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
-            df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
-            df_daily['Rain (in)'] = df_daily['rain'] / 25.4
+            df_daily = _hourly_response_to_daily_df(response.Hourly())
         else:
             daily = response.Daily()
             et_values = daily.Variables(0).ValuesAsNumpy()
             precip_values = daily.Variables(1).ValuesAsNumpy()
-            
+
             dates = pd.date_range(
                 start=pd.to_datetime(daily.Time(), unit="s", utc=True),
                 end=pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
@@ -1427,10 +1441,36 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             )
             df_daily = pd.DataFrame({"time": dates, "ET0 (in)": et_values, "Rain (in)": precip_values})
             df_daily['time'] = df_daily['time'].dt.tz_convert(None)
-            
-        df_daily['time'] = df_daily['time'].dt.normalize()
+            df_daily['time'] = df_daily['time'].dt.normalize()
+
+        if needs_forecast_followup:
+            # Separate try/except -- a failure here (timeout, rate limit) must not discard the
+            # archive fetch above, which already succeeded and is worth keeping/archiving on
+            # its own even if the forecast top-up doesn't come through this time.
+            try:
+                forecast_responses = openmeteo.weather_api(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": lat,
+                        "longitude": lon,
+                        "hourly": ["et0_fao_evapotranspiration", "precipitation"],
+                        "timezone": "auto",
+                        "forecast_days": 14,
+                    },
+                    timeout=15,
+                )
+                df_followup = _hourly_response_to_daily_df(forecast_responses[0].Hourly())
+                # Only keep rows genuinely past what the archive call already returned -- its
+                # last available date lags "today" by a variable amount, so join on the archive
+                # data's own actual max date rather than assuming it reaches today.
+                archive_max = df_daily['time'].max() if not df_daily.empty else pd.Timestamp(today)
+                df_followup = df_followup[df_followup['time'] > archive_max]
+                df_daily = pd.concat([df_daily, df_followup], ignore_index=True)
+            except Exception:
+                pass  # Keep the archive data; the forecast top-up just didn't come through.
+
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
-        
+
     except Exception as e:
         st.error(f"Weather API Error: {e}")
         return None
@@ -1713,7 +1753,33 @@ if selected_tab == "Dashboard":
     with st.expander("📈 View Water Balance Graph", expanded=True):
         st.write(f"### 📈 Water Balance for {active_zone_name}")
 
-        if not df_daily.empty:
+        chart_view = st.radio(
+            "Chart view",
+            ["Daily (ET / Rain / Irrigation)", "Yearly Accumulated Rainfall"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="water_balance_chart_view",
+        )
+
+        if chart_view == "Yearly Accumulated Rainfall":
+            current_year = datetime.now().year
+            ytd_df = df_history[df_history['time'].dt.year == current_year].sort_values('time').copy()
+            if not ytd_df.empty:
+                ytd_df['Cumulative Rain (in)'] = ytd_df['Rain (in)'].cumsum()
+                ytd_total = ytd_df['Cumulative Rain (in)'].iloc[-1]
+                st.caption(f"Year-to-date rainfall for {current_year}: **{ytd_total:.2f}\"** (through {ytd_df['time'].max().date()})")
+
+                ytd_chart = alt.Chart(ytd_df).mark_line(strokeWidth=3, color='#1f77b4').encode(
+                    x=alt.X('time:T', title='Date', axis=alt.Axis(format='%b %d')),
+                    y=alt.Y('Cumulative Rain (in):Q', title='Cumulative Inches'),
+                    tooltip=['time:T', 'Cumulative Rain (in):Q']
+                ).properties(height=400, width='container')
+
+                st.altair_chart(ytd_chart, use_container_width=True)
+            else:
+                st.info(f"No archived rainfall history for {current_year} yet.")
+
+        elif not df_daily.empty:
             now_dt = pd.Timestamp(datetime.now().date()).normalize()
 
             # Configure Default View Zoom Bounds. df_zoom is filtered directly to this window
@@ -1771,15 +1837,16 @@ if selected_tab == "Dashboard":
 
             st.altair_chart(final_chart, use_container_width=True)
 
-        # Centered Explanatory Key Legend
-        st.markdown("""
-        <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
-            <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
-            <div><span style="color:#ADD8E6; font-weight:bold;">▇</span> Rain (Gain)</div>
-            <div><span style="color:#003366; font-weight:bold;">▇</span> Irrigation (Gain)</div>
-            <div><span style="color:red; font-weight:bold;">---</span> Today</div>
-        </div>
-        """, unsafe_allow_html=True)
+        # Centered Explanatory Key Legend (daily view only -- the yearly view is a single line)
+        if chart_view != "Yearly Accumulated Rainfall":
+            st.markdown("""
+            <div style="display: flex; gap: 20px; font-size: 0.8em; justify-content: center; margin-bottom: 20px;">
+                <div><span style="color:#FF8C00; font-weight:bold;">━</span> ET (Loss)</div>
+                <div><span style="color:#ADD8E6; font-weight:bold;">▇</span> Rain (Gain)</div>
+                <div><span style="color:#003366; font-weight:bold;">▇</span> Irrigation (Gain)</div>
+                <div><span style="color:red; font-weight:bold;">---</span> Today</div>
+            </div>
+            """, unsafe_allow_html=True)
 
     # Forecast and Archive Tables View
     with st.expander("📋 View Forecast & History Tables", expanded=False):
@@ -1787,6 +1854,15 @@ if selected_tab == "Dashboard":
         with tab1:
             st.dataframe(df_forecast.set_index("time").style.format("{:.2f}"), use_container_width=True)
         with tab2:
+            current_year = datetime.now().year
+            ytd_history = df_history[df_history['time'].dt.year == current_year]
+            ytd_totals = ytd_history[['ET0 (in)', 'Rain (in)', 'Irrigation (in)']].sum()
+            st.caption(
+                f"**{current_year} Year-to-Date Totals** — "
+                f"ET: {ytd_totals['ET0 (in)']:.2f}\" | "
+                f"Rain: {ytd_totals['Rain (in)']:.2f}\" | "
+                f"Irrigation: {ytd_totals['Irrigation (in)']:.2f}\""
+            )
             st.dataframe(df_history.sort_values('time', ascending=False).set_index("time").style.format("{:.2f}"), use_container_width=True)
 
 
@@ -2191,7 +2267,7 @@ mode_text = "local" if isinstance(conn, MockConnection) else "cloud"
 st.markdown(
     f"""
     <div style='text-align: center; color: gray; font-size: 0.8em;'>
-        Irrigation Dashboard • {mode_text} • v0.39.11
+        Irrigation Dashboard • {mode_text} • v0.40.0
     </div>
     """,
     unsafe_allow_html=True
