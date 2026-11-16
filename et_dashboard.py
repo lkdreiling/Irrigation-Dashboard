@@ -1355,12 +1355,35 @@ openmeteo = openmeteo_requests.Client(session=retry_session)
 
 
 # 7.2 Core Integrated Fetching Routine
+def _hourly_response_to_daily_df(hourly):
+    """Converts an Open-Meteo hourly ET0/precipitation response into a daily-summed,
+    inches-converted dataframe. Shared by the forecast-api branch below and by the
+    archive-api branch's forecast follow-up, since both hit the same hourly endpoint."""
+    et_values = hourly.Variables(0).ValuesAsNumpy()
+    precip_values = hourly.Variables(1).ValuesAsNumpy()
+    dates = pd.date_range(
+        start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+        end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
+        freq=pd.Timedelta(seconds=hourly.Interval()),
+        inclusive="left"
+    )
+    df_hourly = pd.DataFrame({"time": dates, "et0": et_values, "rain": precip_values})
+    df_hourly['time'] = df_hourly['time'].dt.tz_convert(None)
+
+    # Convert metric (mm) to inches and group by day
+    df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
+    df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
+    df_daily['Rain (in)'] = df_daily['rain'] / 25.4
+    df_daily['time'] = df_daily['time'].dt.normalize()
+    return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
+
+
 @st.cache_data(ttl=86400)
 def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
     start_dt = pd.to_datetime(start_date_str).date()
     today = datetime.now().date()
     days_back = (today - start_dt).days
-    
+
     if days_back > 90:
         url = "https://archive-api.open-meteo.com/v1/archive"
         params = {
@@ -1374,6 +1397,11 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             "precipitation_unit": "inch"
         }
         is_hourly = False
+        # The archive API only ever returns data through "today" -- it has no concept of a
+        # forecast. Without this, any fetch that takes this branch (a deep backfill, or simply
+        # a top-up after being away more than 90 days) would leave the next 14 days completely
+        # empty until the *next* fetch happens to land on the other, smaller-gap branch below.
+        needs_forecast_followup = True
     else:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -1389,36 +1417,21 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             "forecast_days": 14
         }
         is_hourly = True
+        needs_forecast_followup = False
 
     try:
         print(f"[OpenMeteo] network fetch: lat={lat} lon={lon} url={url} "
               f"span={params.get('past_days', (today - start_dt).days)}d+forecast start={start_dt} end={today}")
         responses = openmeteo.weather_api(url, params=params, timeout=15)
         response = responses[0]
-        
+
         if is_hourly:
-            hourly = response.Hourly()
-            et_values = hourly.Variables(0).ValuesAsNumpy()
-            precip_values = hourly.Variables(1).ValuesAsNumpy()
-            
-            dates = pd.date_range(
-                start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
-                end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
-                freq=pd.Timedelta(seconds=hourly.Interval()),
-                inclusive="left"
-            )
-            df_hourly = pd.DataFrame({"time": dates, "et0": et_values, "rain": precip_values})
-            df_hourly['time'] = df_hourly['time'].dt.tz_convert(None) 
-            
-            # Convert metric (mm) to inches and group by day
-            df_daily = df_hourly.set_index("time").resample('D').sum().reset_index()
-            df_daily['ET0 (in)'] = df_daily['et0'] / 25.4
-            df_daily['Rain (in)'] = df_daily['rain'] / 25.4
+            df_daily = _hourly_response_to_daily_df(response.Hourly())
         else:
             daily = response.Daily()
             et_values = daily.Variables(0).ValuesAsNumpy()
             precip_values = daily.Variables(1).ValuesAsNumpy()
-            
+
             dates = pd.date_range(
                 start=pd.to_datetime(daily.Time(), unit="s", utc=True),
                 end=pd.to_datetime(daily.TimeEnd(), unit="s", utc=True),
@@ -1427,10 +1440,27 @@ def fetch_weather_integrated(lat, lon, start_date_str, weather_log_path):
             )
             df_daily = pd.DataFrame({"time": dates, "ET0 (in)": et_values, "Rain (in)": precip_values})
             df_daily['time'] = df_daily['time'].dt.tz_convert(None)
-            
-        df_daily['time'] = df_daily['time'].dt.normalize()
+            df_daily['time'] = df_daily['time'].dt.normalize()
+
+        if needs_forecast_followup:
+            forecast_responses = openmeteo.weather_api(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "hourly": ["et0_fao_evapotranspiration", "precipitation"],
+                    "timezone": "auto",
+                    "forecast_days": 14,
+                },
+                timeout=15,
+            )
+            df_followup = _hourly_response_to_daily_df(forecast_responses[0].Hourly())
+            # Only keep genuinely future rows -- the archive call above already covers today.
+            df_followup = df_followup[df_followup['time'] > pd.Timestamp(today)]
+            df_daily = pd.concat([df_daily, df_followup], ignore_index=True)
+
         return df_daily[['time', 'ET0 (in)', 'Rain (in)']]
-        
+
     except Exception as e:
         st.error(f"Weather API Error: {e}")
         return None
