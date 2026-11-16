@@ -142,7 +142,14 @@ try:
     try:
         _init_schema(conn)
     except Exception as e:
-        DB_CONNECTION_ERROR = f"Connected, but table setup failed: {e}"
+        # A failure here means the connection object was constructed but doesn't actually
+        # work (e.g. a paused/unreachable Supabase project) -- fall back the same as a failure
+        # to construct it in the first place. Without this, `conn` stayed as the broken real
+        # connection: the sidebar wrongly reported "Cloud sync active", and every later
+        # conn.query()/conn.session call below independently retried and slowly failed against
+        # the same dead connection instead of failing fast once, here.
+        conn = MockConnection()
+        DB_CONNECTION_ERROR = f"Connection failed during setup: {e}"
 except Exception as e:
     conn = MockConnection()
     DB_CONNECTION_ERROR = str(e)
@@ -166,7 +173,11 @@ else:
 # than relying on a short query ttl to eventually expire.
 def _cache_get(key, loader):
     if key not in st.session_state:
-        st.session_state[key] = loader()
+        # Only the first rerun of a session actually hits this -- every later rerun returns
+        # the cached value above instantly, so the spinner only ever shows for a genuine
+        # one-time cloud fetch, not on every click.
+        with st.spinner("Loading your data..."):
+            st.session_state[key] = loader()
     return st.session_state[key]
 
 
