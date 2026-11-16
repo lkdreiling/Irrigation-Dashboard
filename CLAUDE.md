@@ -46,8 +46,12 @@ Build a workable irrigation dashboard that:
 ## Versioning
 - The version string is tracked in two places and must be bumped together:
   - `README.md` title (line 1)
-  - Footer string in `et_dashboard.py` (`f"Irrigation Dashboard • {mode_text} • vX.XX"`, near the end of the file)
-- **Shipped** (live on `main`, in production): **v0.38**. **In development** (current work branch): **v0.39**. These two numbers will usually differ — `main`'s version only advances when a version branch is merged in per the "Standard merge-to-main sequence" below.
+  - Footer string in `et_dashboard.py` (`f"Irrigation Dashboard • {mode_text} • vX.XX.YY"`, near the end of the file)
+- **Three-part scheme (adopted 2026-11-16): `vMAJOR.MIDDLE.MINOR`** (e.g. `v0.39.10`):
+  - `MAJOR` — big/major milestones. Bumped rarely, by hand, by the user.
+  - `MIDDLE` — the version branch number, same meaning as the old two-part scheme (`v0.33`, `v0.34`, ... `v0.39`). **Git branch names stay two-part** (`v0.39`, not `v0.39.0`) — only the displayed version *string* in README/footer is three-part. Bumped when the user starts a new version branch, per "Starting a new version branch" below; resets `MINOR` to `0`.
+  - `MINOR` — reserved for small patch pushes within the current version branch, in particular an automated weekly check/fix job (design TBD — see Known Implementation Focus Areas). Bumped without creating a new branch or touching `MAJOR`/`MIDDLE`.
+- **Shipped** (live on `main`, in production): **v0.38**. **In development** (current work branch): **v0.39**, currently at patch **v0.39.10**. These numbers will usually differ from `main` — `main`'s version only advances when a version branch is merged in per the "Standard merge-to-main sequence" below.
 - When bumping, grep for the *old* version number across `*.py`/`*.md` (`v0\.3[0-9]`-style pattern) and update only the two authoritative "current version" declarations (README title, `et_dashboard.py` footer) plus this line — leave historical mentions alone (e.g. the branch-model list below naming past versions like `v0.33, v0.34, v0.35...`, or dated notes about a specific past merge). Those are historical record, not the live version.
 
 ## Git / Push Workflow
