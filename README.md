@@ -1,4 +1,4 @@
-# 🌱 Irrigation Dashboard v0.39.11
+# 🌱 Irrigation Dashboard v0.40.0
 
 Irrigation Dashboard is a localized, web-based Evapotranspiration (ET) application that helps you manage lawn and garden watering with precision. By pulling real-time weather data and calculating soil moisture depletion, it tells you exactly **when** to water and **how much** to apply.
 
@@ -6,7 +6,7 @@ Irrigation Dashboard is a localized, web-based Evapotranspiration (ET) applicati
 
 The easiest way to use the dashboard is directly through your web browser via **Streamlit Cloud**:
 
-1. **Launch the App:** Open your deployment URL (e.g., `https://your-app-name.streamlit.app`).
+1. **Launch the App:** Open your deployment URL (e.g., `https://irrigation-dashboard.streamlit.app/`).
 2. **Add Secrets in Streamlit Cloud:** Set your deployment secrets in the Streamlit Cloud UI using the same keys expected by the app.
 3. **Configure Your Property:** Click on the **Property Settings** panel to input your local Zip Code.
 4. **Add Zones:** Fill out your crop/landscape characteristics, square footage, and irrigation flow rates to begin calculations immediately.
