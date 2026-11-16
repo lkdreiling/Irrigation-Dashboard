@@ -142,7 +142,14 @@ try:
     try:
         _init_schema(conn)
     except Exception as e:
-        DB_CONNECTION_ERROR = f"Connected, but table setup failed: {e}"
+        # A failure here means the connection object was constructed but doesn't actually
+        # work (e.g. a paused/unreachable Supabase project) -- fall back the same as a failure
+        # to construct it in the first place. Without this, `conn` stayed as the broken real
+        # connection: the sidebar wrongly reported "Cloud sync active", and every later
+        # conn.query()/conn.session call below independently retried and slowly failed against
+        # the same dead connection instead of failing fast once, here.
+        conn = MockConnection()
+        DB_CONNECTION_ERROR = f"Connection failed during setup: {e}"
 except Exception as e:
     conn = MockConnection()
     DB_CONNECTION_ERROR = str(e)
@@ -166,7 +173,11 @@ else:
 # than relying on a short query ttl to eventually expire.
 def _cache_get(key, loader):
     if key not in st.session_state:
-        st.session_state[key] = loader()
+        # Only the first rerun of a session actually hits this -- every later rerun returns
+        # the cached value above instantly, so the spinner only ever shows for a genuine
+        # one-time cloud fetch, not on every click.
+        with st.spinner("Loading your data..."):
+            st.session_state[key] = loader()
     return st.session_state[key]
 
 
@@ -1718,15 +1729,20 @@ if df_api is not None or not df_permanent.empty:
                 unsafe_allow_html=True
             )
 
-        st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
-        st.divider()
-
-        # Immediate Guidance Callouts
+        # Immediate Guidance -- figure out which message applies first, then render it inside
+        # a popover next to the status line instead of a full-width colored box. These messages
+        # (rain warning, new-zone note, hydrated, irrigation plan) can run several lines, which
+        # pushed the graph below the fold; a popover keeps the status row compact while still
+        # making the detail one click away.
+        guidance_kind = "info"
         if seven_day_rain > current_deficit and current_deficit > 0:
             if rain_confidence is not None and rain_confidence < RAIN_SKIP_CONFIDENCE_THRESHOLD:
-                st.info(f"🌦️ **Rain is possible, but not confident:** The 7-day forecast predicts **{seven_day_rain:.2f}\"**, but the day(s) driving that total are only **{rain_confidence:.0f}%** likely to see rain. Watering as planned is probably still the safer bet.")
+                guidance_label = "🌦️ Rain Possible"
+                guidance_text = f"🌦️ **Rain is possible, but not confident:** The 7-day forecast predicts **{seven_day_rain:.2f}\"**, but the day(s) driving that total are only **{rain_confidence:.0f}%** likely to see rain. Watering as planned is probably still the safer bet."
             else:
-                st.warning(f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!")
+                guidance_kind = "warning"
+                guidance_label = "🌧️ Rain Coming"
+                guidance_text = f"🌧️ **Rain is coming:** The 7-day forecast predicts **{seven_day_rain:.2f}\"** of rain. Consider skipping today!"
         elif current_deficit <= 0 and not zone_logs:
             # Never-watered zone reading 0" is an assumption (field capacity), not a measurement --
             # pair it with a reference runtime computed as if the zone were bone dry (PWP) so a
@@ -1734,15 +1750,32 @@ if df_api is not None or not df_permanent.empty:
             full_runtime = (paw_total * 60 / pr_in_hr) if pr_in_hr > 0 else 0
             full_cycles, _, _ = core_logic.recommend_cycle_soak(pr_in_hr, soil_choice, full_runtime)
             cycle_note = f" Consider **{full_cycles} cycles of ~{full_runtime / full_cycles:.1f} min** each (30–40 min soak between starts) instead of one continuous pass." if full_cycles > 1 else ""
-            st.info(f"🌱 **New Zone:** Starting at 0\" deficit (assumed field capacity) until real readings accumulate. If this zone were completely dry, a full soak would take an estimated **{full_runtime:.1f} minutes** at current settings.{cycle_note}")
+            guidance_label = "🌱 New Zone"
+            guidance_text = f"🌱 **New Zone:** Starting at 0\" deficit (assumed field capacity) until real readings accumulate. If this zone were completely dry, a full soak would take an estimated **{full_runtime:.1f} minutes** at current settings.{cycle_note}"
         elif current_deficit <= 0:
-            st.success(f"✅ **Soil is Hydrated!**")
+            guidance_kind = "success"
+            guidance_label = "✅ Hydrated"
+            guidance_text = "✅ **Soil is Hydrated!**"
         else:
             cycles, _, _ = core_logic.recommend_cycle_soak(pr_in_hr, soil_choice, runtime)
+            guidance_label = "⏱️ Irrigation Plan"
             if cycles > 1:
-                st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity — but split into **{cycles} cycles of ~{runtime / cycles:.1f} min** each (30–40 min soak between starts) rather than one continuous pass (see Reference F).")
+                guidance_text = f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity — but split into **{cycles} cycles of ~{runtime / cycles:.1f} min** each (30–40 min soak between starts) rather than one continuous pass (see Reference F)."
             else:
-                st.info(f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity.")
+                guidance_text = f"⏱️ **Irrigation Plan:** Run for **{runtime:.1f} minutes** to refill root zone capacity."
+
+        status_col, guidance_col = st.columns([4, 1])
+        with status_col:
+            st.markdown(f"**Status:** {status_msg} | **Estimated Runtime:** {runtime:.1f} min ({gallons:.0f} gal needed)")
+        with guidance_col:
+            with st.popover(guidance_label, use_container_width=True):
+                if guidance_kind == "warning":
+                    st.warning(guidance_text)
+                elif guidance_kind == "success":
+                    st.success(guidance_text)
+                else:
+                    st.info(guidance_text)
+        st.divider()
 
 
 # ==============================================================================
